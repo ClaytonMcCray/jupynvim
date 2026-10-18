@@ -454,6 +454,11 @@ local function spawn_client(cmd_vec, alias, trust)
     local p = args[1] or args
     Log.debug("kernel_event: " .. vim.inspect(p):sub(1, 200))
   end)
+  -- The kernel process died on its own (never for a stop or restart).
+  client:on("kernel_exited", function(args)
+    local p = args[1] or args
+    M._handle_kernel_exited(p)
+  end)
   -- Backend-initiated user-facing messages (e.g. "installing ipykernel into
   -- this env..." during a first-use kernel start).
   client:on("user_message", function(args)

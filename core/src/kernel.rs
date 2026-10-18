@@ -130,13 +130,26 @@ pub enum KernelEvent {
         parent_msg_id: Option<String>,
         info: Value,
     },
+    /// The kernel process ended on its own: `os._exit()`, a segfault in an
+    /// extension, the OOM killer. Never sent for a `kill()` we asked for.
+    /// One of the two is set; a signal death has no exit code.
+    Exited {
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    },
 }
+
+/// Asks the child-watcher task to kill the kernel; the inner sender is
+/// answered once the process has been reaped.
+type KillRequest = oneshot::Sender<oneshot::Sender<()>>;
 
 pub struct Kernel {
     spec: KernelSpec,
     conn: ConnectionInfo,
     session: String,
-    child: Mutex<Child>,
+    /// The child itself lives in `watch_child`, which is the only task that
+    /// can `wait()` on it. None once a kill was requested.
+    kill_tx: Mutex<Option<KillRequest>>,
     /// Outgoing-frame channel for shell socket (the socket-owning task drains this)
     shell_tx: mpsc::UnboundedSender<ZmqMessage>,
     /// Outgoing-frame channel for control socket
@@ -220,6 +233,7 @@ impl Kernel {
         let tx_iopub = tx.clone();
         let tx_shell = tx.clone();
         let tx_pipes = tx.clone();
+        let tx_exit = tx.clone();
         let key = conn.key.as_bytes().to_vec();
         let iopub_handle = tokio::spawn(iopub_loop(iopub, key.clone(), tx_iopub));
 
@@ -257,11 +271,18 @@ impl Kernel {
                 active_msg_id.clone(), tx_pipes));
         }
 
+        // Reap the process. Without this a kernel that died mid-run was
+        // never noticed: the running cell stayed busy, the cells queued
+        // behind it stayed queued, and later executes were accepted and
+        // silently went nowhere.
+        let (kill_tx, kill_rx) = oneshot::channel();
+        tokio::spawn(watch_child(child, kill_rx, tx_exit));
+
         Ok(Self {
             spec,
             conn,
             session,
-            child: Mutex::new(child),
+            kill_tx: Mutex::new(Some(kill_tx)),
             shell_tx,
             control_tx,
             iopub_handle,
@@ -410,12 +431,150 @@ impl Kernel {
         Ok(())
     }
 
+    /// Stop the kernel process on purpose. This is the one way to end it
+    /// that does not produce a `KernelEvent::Exited`.
     pub async fn kill(&self) -> Result<()> {
         self.iopub_handle.abort();
-        let mut child = self.child.lock().await;
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        let req = self.kill_tx.lock().await.take();
+        let Some(req) = req else { return Ok(()) };
+        let (ack_tx, ack_rx) = oneshot::channel();
+        // A failed send means the watcher is gone: the process already
+        // exited by itself and was reaped, so there is nothing to kill.
+        if req.send(ack_tx).is_ok() {
+            // The ack is dropped unanswered if the watcher cannot reap the
+            // child; do not hang stop/restart on that.
+            let _ = tokio::time::timeout(Duration::from_secs(5), ack_rx).await;
+        }
         Ok(())
+    }
+}
+
+/// Owns the kernel process until it is gone. A kill request wins over a
+/// natural exit: the process is killed, reaped, the requester is told, and
+/// no event is sent. A natural exit is reported as `KernelEvent::Exited`.
+async fn watch_child(
+    mut child: Child,
+    kill_rx: oneshot::Receiver<oneshot::Sender<()>>,
+    tx: mpsc::UnboundedSender<KernelEvent>,
+) {
+    tokio::select! {
+        // `Child::wait` is cancel-safe, so losing this arm to a kill
+        // request is fine.
+        status = child.wait() => {
+            let (exit_code, signal) = match status {
+                Ok(st) => (st.code(), status_signal(&st)),
+                Err(e) => {
+                    tracing::warn!("kernel wait: {e}");
+                    (None, None)
+                }
+            };
+            tracing::warn!(?exit_code, ?signal, "kernel process exited on its own");
+            let _ = tx.send(KernelEvent::Exited { exit_code, signal });
+        }
+        req = kill_rx => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            // Err: the Kernel was dropped without kill(); kill_on_drop
+            // already covered the process, there is no one to tell.
+            if let Ok(ack) = req {
+                let _ = ack.send(());
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn status_signal(st: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    st.signal()
+}
+
+#[cfg(not(unix))]
+fn status_signal(_st: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spawn(cmd: &str) -> Child {
+        Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sh")
+    }
+
+    #[tokio::test]
+    async fn a_kernel_that_dies_on_its_own_is_reported_with_its_exit_code() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_kill_tx, kill_rx) = oneshot::channel::<oneshot::Sender<()>>();
+        tokio::spawn(watch_child(spawn("exit 3"), kill_rx, tx));
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no exit event within 5s")
+            .expect("event channel closed without an exit event");
+        match ev {
+            KernelEvent::Exited { exit_code, signal } => {
+                assert_eq!(exit_code, Some(3));
+                assert_eq!(signal, None);
+            }
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_kernel_killed_by_a_signal_reports_the_signal() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_kill_tx, kill_rx) = oneshot::channel::<oneshot::Sender<()>>();
+        tokio::spawn(watch_child(spawn("kill -9 $$"), kill_rx, tx));
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no exit event within 5s")
+            .expect("event channel closed without an exit event");
+        match ev {
+            KernelEvent::Exited { exit_code, signal } => {
+                assert_eq!(exit_code, None);
+                assert_eq!(signal, Some(9));
+            }
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deliberate_kill_is_acked_and_not_reported_as_an_exit() {
+        // What stop_kernel and restart_kernel do: the user asked for this
+        // death, so the frontend must not be told the kernel died on it.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (kill_tx, kill_rx) = oneshot::channel::<oneshot::Sender<()>>();
+        tokio::spawn(watch_child(spawn("sleep 30"), kill_rx, tx));
+        let (ack_tx, ack_rx) = oneshot::channel();
+        kill_tx.send(ack_tx).expect("watcher gone before the kill request");
+        tokio::time::timeout(Duration::from_secs(5), ack_rx)
+            .await
+            .expect("kill not acked within 5s")
+            .expect("watcher dropped the ack");
+        // The watcher has returned and dropped its sender, so the channel
+        // closes with nothing in it.
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("event channel still open after the kill");
+        assert!(ev.is_none(), "kill reported as an unexpected exit: {ev:?}");
+    }
+
+    #[tokio::test]
+    async fn killing_an_already_dead_kernel_is_a_noop() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (kill_tx, kill_rx) = oneshot::channel::<oneshot::Sender<()>>();
+        tokio::spawn(watch_child(spawn("exit 0"), kill_rx, tx));
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        // the watcher is gone, so the request has no receiver: that is what
+        // Kernel::kill treats as "nothing left to do"
+        let (ack_tx, _ack_rx) = oneshot::channel();
+        assert!(kill_tx.send(ack_tx).is_err());
     }
 }
 

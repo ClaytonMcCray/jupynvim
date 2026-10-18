@@ -327,6 +327,78 @@ def t_silent_execute():
     os.unlink(nb_path)
 
 
+def make_dying_nb():
+    # k1 kills the kernel from inside while k2 and k3 wait behind it
+    return {
+        "cells": [
+            {"cell_type": "code", "id": "k1", "metadata": {}, "source": "import os, time\ntime.sleep(0.3)\nos._exit(0)", "execution_count": None, "outputs": []},
+            {"cell_type": "code", "id": "k2", "metadata": {}, "source": "print(2)", "execution_count": None, "outputs": []},
+            {"cell_type": "code", "id": "k3", "metadata": {}, "source": "print(3)", "execution_count": None, "outputs": []},
+        ],
+        "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"}},
+        "nbformat": 4, "nbformat_minor": 5,
+    }
+
+
+def _notification(ev, method):
+    return isinstance(ev, list) and ev[0] == 2 and ev[1] == method
+
+
+def t_kernel_death_reported():
+    # A kernel that dies mid-run (os._exit, OOM kill) used to go unnoticed:
+    # the running cell stayed busy, the cells queued behind it stayed queued,
+    # and later executes were accepted and silently ran nothing.
+    cl = Client()
+    nb_path = tempfile.mktemp(suffix=".ipynb")
+    json.dump(make_dying_nb(), open(nb_path, "w"))
+    _, res = cl.call("open", {"path": nb_path})
+    sid = res["session_id"]
+    cl.call("start_kernel", {"session_id": sid}, timeout=15)
+    time.sleep(0.5)
+    kpids = _kernel_pids_of(cl.p.pid)
+    for cid in ("k1", "k2", "k3"):
+        err, _ = cl.call("execute", {"session_id": sid, "cell_id": cid})
+        if err:
+            report("kernel death: submitting the run", False, f"{cid}: {err}")
+    ev = cl.wait_event(
+        lambda e: _notification(e, "kernel_exited") and e[2][0].get("session_id") == sid,
+        timeout=10)
+    report("kernel death is reported as kernel_exited with its exit code",
+           ev is not None and ev[2][0].get("exit_code") == 0, str(ev))
+    report("dead kernel process is reaped", not _wait_all_dead(kpids, 5), f"still alive: {kpids}")
+    err, _ = cl.call("execute", {"session_id": sid, "cell_id": "k2"})
+    report("execute after the kernel died is refused",
+           err is not None and "kernel not started" in str(err), str(err))
+    # the session is still usable: a fresh start brings a kernel back
+    err, _ = cl.call("start_kernel", {"session_id": sid}, timeout=15)
+    report("kernel starts again after it died", err is None, str(err))
+    err, _ = cl.call("execute", {"session_id": sid, "cell_id": "k2"})
+    report("execute works on the replacement kernel", err is None, str(err))
+    cl.call("stop_kernel", {"session_id": sid})
+    cl.stop()
+    os.unlink(nb_path)
+
+
+def t_stop_and_restart_are_not_exits():
+    # Only a death the user did not ask for is news. stop and restart kill
+    # the process on purpose and must not raise kernel_exited.
+    cl = Client()
+    nb_path = tempfile.mktemp(suffix=".ipynb")
+    json.dump(make_test_nb(), open(nb_path, "w"))
+    _, res = cl.call("open", {"path": nb_path})
+    sid = res["session_id"]
+    cl.call("start_kernel", {"session_id": sid}, timeout=15)
+    err, _ = cl.call("restart_kernel", {"session_id": sid}, timeout=20)
+    report("restart_kernel returns", err is None, str(err))
+    err, _ = cl.call("stop_kernel", {"session_id": sid})
+    report("stop_kernel returns", err is None, str(err))
+    time.sleep(1.0)
+    exits = [e for e in cl.events if _notification(e, "kernel_exited")]
+    report("stop and restart do not report an unexpected exit", not exits, str(exits))
+    cl.stop()
+    os.unlink(nb_path)
+
+
 # ── kernel-cleanup helpers ──────────────────────────────────────────────
 def _child_pids(ppid):
     out = subprocess.run(["pgrep", "-P", str(ppid)], capture_output=True, text=True).stdout
@@ -416,6 +488,7 @@ TESTS = [
     t_ping, t_list_kernels, t_open_close, t_kernel_lifecycle,
     t_run_cell_streams, t_run_cell_expression, t_run_cell_error,
     t_save_roundtrip, t_image_output, t_insert_delete_move, t_silent_execute,
+    t_kernel_death_reported, t_stop_and_restart_are_not_exits,
     t_kernel_killed_on_disconnect, t_kernel_killed_on_sigterm,
 ]
 
