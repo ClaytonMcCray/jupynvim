@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::Server;
-use crate::kernel::Kernel;
+use crate::kernel::{Kernel, KernelEvent};
 use crate::kernelspec;
 
 impl Server {
@@ -152,6 +152,8 @@ impl Server {
         // fallback is not what the notebook's metadata says.
         let language = kernel.spec().language.clone();
         let argv = kernel.spec().argv.clone();
+        // identifies this kernel in the slot: a restart puts a new one there
+        let kernel_session = kernel.session().to_string();
         let mut rx = kernel
             .take_events()
             .await
@@ -174,6 +176,30 @@ impl Server {
         let sid_clone = sid.clone();
         tokio::spawn(async move {
             while let Some(ev) = rx.recv().await {
+                if let KernelEvent::Exited { exit_code, signal } = &ev {
+                    // The process is gone, so the slot must say so: with it
+                    // still Some, every later execute was accepted and
+                    // silently ran nothing. Only this kernel is cleared;
+                    // a restart that already replaced it is left alone,
+                    // and then the exit is old news and not reported.
+                    let mut slot = session_clone.kernel.write().await;
+                    let ours = slot.as_ref().map_or(false, |k| k.session() == kernel_session);
+                    if !ours {
+                        continue;
+                    }
+                    if let Some(dead) = slot.take() {
+                        // nothing to kill any more; this tears down the
+                        // iopub task like a stop does
+                        let _ = dead.kill().await;
+                    }
+                    drop(slot);
+                    server.notify("kernel_exited", json!({
+                        "session_id": sid_clone,
+                        "exit_code": exit_code,
+                        "signal": signal,
+                    })).await;
+                    continue;
+                }
                 if let Some((cell_id, payload)) = session_clone.apply_event(&ev) {
                     let note = json!({
                         "session_id": sid_clone,

@@ -293,6 +293,8 @@ impl Session {
             KernelEvent::UpdateDisplayData { parent_msg_id, .. } => parent_msg_id.clone(),
             KernelEvent::ClearOutput { parent_msg_id, .. } => parent_msg_id.clone(),
             KernelEvent::KernelInfo { parent_msg_id, .. } => parent_msg_id.clone(),
+            // belongs to no cell; start_kernel's event pump handles it
+            KernelEvent::Exited { .. } => None,
         }?;
         let cell_id = self.msg_to_cell.get(&parent)?.clone();
 
@@ -462,6 +464,7 @@ impl Session {
             KernelEvent::KernelInfo { info, .. } => {
                 json!({ "kind": "kernel_info", "info": info })
             }
+            KernelEvent::Exited { .. } => unreachable!("has no parent msg_id"),
         };
         if clear_first {
             payload["clear_first"] = json!(true);

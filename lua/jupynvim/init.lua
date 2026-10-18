@@ -308,6 +308,42 @@ function M._handle_cell_event(p)
   Log.warn("no buf for session " .. tostring(p.session_id))
 end
 
+-- How a kernel death reads in a message: "exit code 0" for os._exit(0),
+-- "signal 9" for the OOM killer, and the bare word when the backend could
+-- not tell.
+function M._kernel_exit_reason(p)
+  if p.exit_code ~= nil and p.exit_code ~= vim.NIL then
+    return "exit code " .. tostring(p.exit_code)
+  elseif p.signal ~= nil and p.signal ~= vim.NIL then
+    return "signal " .. tostring(p.signal)
+  end
+  return "unknown cause"
+end
+
+-- The backend reaped the kernel process: it died on its own (os._exit, a
+-- crashing extension, the OOM killer), not through stop or restart. Nothing
+-- will send the running cell its idle, nor run the cells queued behind it,
+-- so they are released now, and the next run says why it cannot happen.
+function M._handle_kernel_exited(p)
+  if not p or not p.session_id then
+    Log.warn("kernel_exited missing session_id: " .. vim.inspect(p):sub(1, 200))
+    return
+  end
+  local reason = M._kernel_exit_reason(p)
+  for _, nb in pairs(Notebook.all()) do
+    if nb.session_id == p.session_id then
+      nb.kernel_started = false
+      -- appended to the "kernel not started" error of a later run
+      nb.kernel_error = "the kernel exited with " .. reason
+      M._release_pending(nb)
+      vim.notify(("jupynvim: kernel exited unexpectedly (%s). Pending cells were released; " ..
+        "restart the kernel to keep working."):format(reason), vim.log.levels.WARN)
+      return
+    end
+  end
+  Log.warn("kernel_exited: no notebook for session " .. tostring(p.session_id))
+end
+
 -- ---------- buffer lifecycle ----------
 
 M._opening = M._opening or {}
@@ -1957,7 +1993,7 @@ end
 
 -- "kernel not started" alone is unactionable. While a start is in flight
 -- (first use may be pip-installing ipykernel into the env), say so calmly;
--- otherwise append the actual start failure.
+-- otherwise append why: the start failure, or the kernel's death.
 function M._notify_exec_error(nb, err)
   if tostring(err):find("kernel not started") then
     if nb.kernel_starting then
@@ -1965,7 +2001,7 @@ function M._notify_exec_error(nb, err)
         vim.log.levels.WARN)
       return
     elseif nb.kernel_error then
-      err = tostring(err) .. "\n  last start_kernel error: " .. nb.kernel_error
+      err = tostring(err) .. "\n  reason: " .. nb.kernel_error
     end
   end
   vim.notify("execute: " .. tostring(err), vim.log.levels.ERROR)

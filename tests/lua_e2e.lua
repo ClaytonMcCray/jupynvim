@@ -21,7 +21,9 @@ local function test_pcall(name, fn)
 end
 
 -- Setup plugin
-require("jupynvim").setup({ log_level = "info" })
+-- JUPYNVIM_TEST_CORE points the suite at a particular binary (a debug build,
+-- say); without it the release build in this repo is used, as for users.
+require("jupynvim").setup({ log_level = "info", core_path = vim.env.JUPYNVIM_TEST_CORE })
 local J = require("jupynvim")
 local NB = require("jupynvim.notebook")
 
@@ -490,6 +492,68 @@ test_pcall("set_cell_type to markdown clears outputs", function()
   report("set_cell_type to markdown clears outputs",
          c.cell_type == "markdown" and #c.outputs == 0,
          "type=" .. c.cell_type .. " outs=" .. #c.outputs)
+  os.remove(p)
+end)
+
+-- T11.9: a kernel that dies mid Run-all (here os._exit(0) with two cells
+-- queued behind it) must leave no busy or queued badge, tell the user, and
+-- make the next run report that the kernel is not started. Before the
+-- backend reaped the process, the running cell ticked forever, the queued
+-- ones never released, and later runs were accepted and ran nothing.
+test_pcall("kernel death mid-run releases cells and is reported", function()
+  local p = vim.fn.tempname() .. ".ipynb"
+  local f = io.open(p, "w")
+  f:write([[{"cells":[
+    {"cell_type":"code","id":"k1","metadata":{},"source":"import os, time\ntime.sleep(0.5)\nos._exit(0)","execution_count":null,"outputs":[]},
+    {"cell_type":"code","id":"k2","metadata":{},"source":"print(2)","execution_count":null,"outputs":[]},
+    {"cell_type":"code","id":"k3","metadata":{},"source":"print(3)","execution_count":null,"outputs":[]}
+  ],"metadata":{"kernelspec":{"name":"python3","display_name":"P","language":"python"}},"nbformat":4,"nbformat_minor":5}]])
+  f:close()
+  local buf = J.open(p)
+  local nb
+  local started = wait_until(function()
+    nb = NB.get(buf)
+    return nb ~= nil and nb.kernel_started == true
+  end, 20000)
+  if not started then
+    report("kernel death mid-run releases cells and is reported", false, "kernel never started")
+    os.remove(p)
+    return
+  end
+  local notes = {}
+  local real_notify = vim.notify
+  vim.notify = function(msg) notes[#notes + 1] = tostring(msg) end
+  local function st(id) return nb.cell_state[id] and nb.cell_state[id].exec_state or "nil" end
+  J.run_all(buf)
+  -- the run is under way: k1 running, the others waiting behind it
+  local running = wait_until(function() return st("k1") == "busy" end, 8000)
+  local mid = ("k1=%s k2=%s k3=%s"):format(st("k1"), st("k2"), st("k3"))
+  -- then the kernel dies, and the frontend hears about it
+  local died = wait_until(function() return nb.kernel_started == false end, 10000)
+  local after = ("k1=%s k2=%s k3=%s"):format(st("k1"), st("k2"), st("k3"))
+  local settled = st("k1") == "idle" and st("k2") == "idle" and st("k3") == "idle"
+    and nb.cell_state["k1"].failed == true
+  local told = false
+  for _, n in ipairs(notes) do
+    if n:find("kernel exited unexpectedly", 1, true) and n:find("exit code 0", 1, true) then told = true end
+  end
+  -- a later run is refused by the backend, and the message says why
+  notes = {}
+  vim.api.nvim_set_current_buf(buf)
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  J.run_cell(buf, { advance = false })
+  local refused = wait_until(function()
+    for _, n in ipairs(notes) do
+      if n:find("kernel not started", 1, true) and n:find("exit code 0", 1, true) then return true end
+    end
+    return false
+  end, 8000)
+  vim.notify = real_notify
+  report("kernel death mid-run releases cells and is reported",
+         running and died and settled and told and refused and st("k1") == "idle",
+         ("running=%s (%s) died=%s settled=%s (%s) told=%s refused=%s notes=%s"):format(
+           tostring(running), mid, tostring(died), tostring(settled), after,
+           tostring(told), tostring(refused), vim.inspect(notes)))
   os.remove(p)
 end)
 

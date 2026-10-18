@@ -313,8 +313,43 @@ J.run_above(buf)
 assert(#calls == 1 and calls[1].params.cell_id == "c2" and nb.cell_state["c2"].exec_state == "queued"
   and nb.cell_state["c3"].exec_state == "idle", "run_above queues only the cells above")
 nb:release_pending()
-J._nb_client, vim.notify = real_client, real_notify
 print("F5. run all/below/above queue up front, stop + release on failure ok")
+
+-- F6. the kernel process dies mid Run-all (os._exit, OOM kill): the backend's
+-- kernel_exited notification finishes the running cell as failed, releases
+-- the queued ones, marks the kernel stopped and tells the user why; the next
+-- run's "kernel not started" carries the cause.
+calls, notes = {}, {}
+J.run_all(buf)
+calls[1].cb(nil); calls[2].cb(nil); calls[3].cb(nil); calls[4].cb(nil)   -- both accepted
+nb:apply_cell_event("c2", { kind = "execute_input", execution_count = 7 })  -- c2 runs, c3 waits
+assert(nb.cell_state["c2"].exec_state == "busy" and nb.cell_state["c3"].exec_state == "queued", "setup")
+nb.kernel_started = true
+J._handle_kernel_exited({ session_id = "other-session", exit_code = 1 })
+assert(nb.cell_state["c2"].exec_state == "busy" and nb.kernel_started == true and #notes == 0,
+  "another session's kernel death must not touch this notebook")
+J._handle_kernel_exited({ session_id = nb.session_id, exit_code = 0, signal = vim.NIL })
+assert(nb.cell_state["c2"].exec_state == "idle" and nb.cell_state["c2"].failed and nb.cell_state["c2"].duration_ns,
+  "the running cell is finished as failed with its stopwatch stopped: " .. vim.inspect(nb.cell_state["c2"]))
+assert(nb.cell_state["c3"].exec_state == "idle", "the queued cell is released")
+assert(nb.kernel_started == false, "the notebook must know its kernel is gone")
+assert(#notes == 1 and notes[1]:find("kernel exited unexpectedly", 1, true) and notes[1]:find("exit code 0", 1, true),
+  "the user is told, with the exit code: " .. vim.inspect(notes))
+-- a later run fails at the backend with "kernel not started"; the message says why
+notes, calls = {}, {}
+vim.api.nvim_win_set_cursor(win, { CellMode.ranges(buf)[2].start + 1, 0 })
+J.run_cell(buf, { advance = false })
+calls[1].cb(nil); calls[2].cb("kernel not started")
+assert(#notes == 1 and notes[1]:find("kernel not started", 1, true) and notes[1]:find("exited with exit code 0", 1, true),
+  "the refused run must name the kernel's death: " .. vim.inspect(notes))
+assert(nb.cell_state["c2"].exec_state == "idle", "the refused cell is not left queued")
+-- a signal death reads as the signal
+notes = {}
+J._handle_kernel_exited({ session_id = nb.session_id, exit_code = vim.NIL, signal = 9 })
+assert(#notes == 1 and notes[1]:find("signal 9", 1, true), "a signal death names the signal: " .. vim.inspect(notes))
+assert(J._kernel_exit_reason({}) == "unknown cause", "no code and no signal still reads")
+J._nb_client, vim.notify = real_client, real_notify
+print("F6. kernel death mid-run: cells released, kernel marked stopped, user told ok")
 
 -- F2. duration survives save + reopen: restored from jupyter-standard
 --     timing metadata (metadata.execution stamps)
