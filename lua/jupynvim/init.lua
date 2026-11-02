@@ -75,8 +75,9 @@ M.config = {
   -- output is untouched: the .ipynb keeps everything and save is lossless, this
   -- only bounds what treesitter and every other FileType plugin has to parse.
   -- One `!tree` of a dataset directory otherwise puts 24k live lines in the
-  -- buffer and costs 2s of frozen UI on open. Head and tail are both kept, so
-  -- a training log still shows its final epochs. 0 disables the cap.
+  -- buffer and costs 2s of frozen UI on open. A longer output shows its first
+  -- max_output_lines lines and its last 5, so a training log still shows how
+  -- it ended. <leader>nl sets another number for one cell. 0 disables the cap.
   max_output_lines = 500,
 
   -- When an SSH session is active, these keys open the REMOTE tree explorer
@@ -511,6 +512,9 @@ function M.open(path, opts)
 
   local nb = Notebook.create(buf, abs, sid, snap)
   nb.notebook_meta = { language = ft }
+  -- the undo file read back below holds outputs as the last save showed them
+  local uf = vim.api.nvim_buf_call(buf, function() return vim.fn.undofile(abs) end)
+  M._restore_views(nb, uf)
   M._populate_buffer(nb)
   -- Snapshot the rendered buffer text as the "saved" baseline. TextChanged
   -- compares against this to decide whether to force modified=true. Without
@@ -550,7 +554,6 @@ function M.open(path, opts)
   -- cells correctly. Vim's normal-load path auto-reads the undo file, but
   -- our BufReadCmd hijack bypasses that, so we rundo manually here.
   vim.bo[buf].undofile = true
-  local uf = vim.api.nvim_buf_call(buf, function() return vim.fn.undofile(abs) end)
   vim.api.nvim_buf_call(buf, function()
     if uf ~= "" and vim.fn.filereadable(uf) == 1 then
       pcall(vim.cmd, "silent! rundo " .. vim.fn.fnameescape(uf))
@@ -1422,22 +1425,70 @@ local function history_note(uf)
   return vim.fn.stdpath("state") .. "/jupynvim/undo/" .. vim.fn.sha256(uf) .. ".json"
 end
 
+local function read_note(uf)
+  local f = uf and uf ~= "" and io.open(history_note(uf), "r")
+  if not f then return nil end
+  local ok, note = pcall(vim.json.decode, f:read("*a"))
+  f:close()
+  return ok and type(note) == "table" and note or nil
+end
+
 -- Written with the undo file on every save: how far back that history
--- belongs to the cell list saved with it, and which of its steps are the
--- plugin's own rewrites. The undo file itself cannot say.
+-- belongs to the cell list saved with it, which of its steps are the
+-- plugin's own rewrites, and which outputs showed expanded, hidden or cut to
+-- their own number of lines. The undo file itself cannot say.
 function M._note_history(nb, uf)
   local ut = vim.api.nvim_buf_call(nb.buf, vim.fn.undotree)
   local floor = nb._ck_nr or 0
   local rw = {}
   for k in pairs(nb._rewrites or {}) do if k >= floor then rw[#rw + 1] = k end end
   table.sort(rw)
+  local views = { expanded = {}, hidden = {}, limits = vim.empty_dict() }
+  for _, c in ipairs(nb.cells) do
+    if c._output_expanded then table.insert(views.expanded, c.id) end
+    if c._output_hidden then table.insert(views.hidden, c.id) end
+    if c._output_limit then views.limits[c.id] = c._output_limit end
+  end
   local path = history_note(uf)
   pcall(vim.fn.mkdir, vim.fn.fnamemodify(path, ":h"), "p")
   local f = io.open(path, "w")
   if not f then return end
   f:write(vim.json.encode({ hash = nb.saved_hash, cur = ut.seq_cur, last = ut.seq_last,
-                            floor = floor, rewrites = rw }))
+                            floor = floor, rewrites = rw, views = views }))
   f:close()
+end
+
+-- Show the outputs as the last save showed them, expanded, hidden or cut to
+-- their own number of lines, before the first populate. Vim reads an undo file back only onto the very text it
+-- was written from, and output rows are text. Opened cut or shown, a notebook
+-- saved with an output expanded or hidden lost its undo history.
+function M._restore_views(nb, uf)
+  local note = read_note(uf)
+  local views = note and note.views
+  if type(views) ~= "table" then return end
+  local function set(list)
+    local s = {}
+    for _, id in ipairs(type(list) == "table" and list or {}) do s[id] = true end
+    return s
+  end
+  local expanded, hidden = set(views.expanded), set(views.hidden)
+  local limits = type(views.limits) == "table" and views.limits or {}
+  local any = false
+  for _, c in ipairs(nb.cells) do
+    c._output_expanded = expanded[c.id]
+    c._output_hidden = hidden[c.id]
+    local n = tonumber(limits[c.id])
+    c._output_limit = n and n >= 1 and n % 1 == 0 and n or nil
+    any = any or expanded[c.id] or hidden[c.id] or c._output_limit ~= nil
+  end
+  -- Worth it only on the very text the undo file was written from. Kept on a
+  -- file changed since, an expanded output stayed uncut through whatever
+  -- prints under that cell id now.
+  if any and note.hash ~= vim.fn.sha256(table.concat((nb:to_lines()), "\n")) then
+    for _, c in ipairs(nb.cells) do
+      c._output_expanded, c._output_hidden, c._output_limit = nil, nil, nil
+    end
+  end
 end
 
 -- Open wipes the undo history, then reads it back from the undo file, so the
@@ -1458,13 +1509,8 @@ function M._start_history(nb, uf)
     nb._seen[0] = nb._ck
   else
     floor = ut.seq_last + 1
-    local f = uf and uf ~= "" and io.open(history_note(uf), "r")
-    local ok, note = false, nil
-    if f then
-      ok, note = pcall(vim.json.decode, f:read("*a"))
-      f:close()
-    end
-    if ok and type(note) == "table" and note.hash == nb.saved_hash and note.cur == ut.seq_cur
+    local note = read_note(uf)
+    if note and note.hash == nb.saved_hash and note.cur == ut.seq_cur
         and note.last == ut.seq_last and type(note.floor) == "number" then
       floor = note.floor
       for _, k in ipairs(type(note.rewrites) == "table" and note.rewrites or {}) do
@@ -2468,7 +2514,9 @@ function M.clear_outputs(buf)
       nb.cell_state[c.id] = nil
       -- Drop only code-cell output images; markdown embedded images
       -- (keys like "<id>_md_<idx>") stay so the cell still renders them.
-      for _, key in ipairs(Image.clear_outputs_for_cell(c.id)) do nb.image_ids[key] = nil end
+      for _, key in ipairs(Image.clear_outputs_for_cell(Image.output_owner(nb.buf, c.id))) do
+        nb.image_ids[key] = nil
+      end
     end
   end
   -- Outputs are REAL buffer lines (Notebook:to_lines emits them under each
@@ -2510,7 +2558,9 @@ function M.clear_cell_output(buf)
   if type(cell.metadata) == "table" then cell.metadata.execution = nil end
   nb.cell_state[cell.id] = nil
   nb.image_ids = nb.image_ids or {}
-  for _, key in ipairs(Image.clear_outputs_for_cell(cell.id)) do nb.image_ids[key] = nil end
+  for _, key in ipairs(Image.clear_outputs_for_cell(Image.output_owner(nb.buf, cell.id))) do
+    nb.image_ids[key] = nil
+  end
   -- Same as clear_outputs: the output text lives in the buffer, so the model
   -- edit only shows up once the buffer is rewritten.
   M._populate_buffer(nb, { edit = true, clear = true })
@@ -2774,27 +2824,118 @@ function M._write_image(cell, img, path)
   vim.notify("jupynvim: saved " .. path, vim.log.levels.INFO)
 end
 
--- Compatibility shim for the old name; defaults to "down" direction.
--- Expand or re-collapse the truncated output of the cell under the cursor.
-function M.toggle_output_expand(buf)
+-- The notebook and the cell under the cursor, its source brought up to date
+-- from the buffer, which the output toggles below rebuild from the cells.
+local function cursor_cell(buf)
   local nb = Notebook.get(buf)
   if not nb then return end
-  M._sync_model(nb)   -- the buffer is rebuilt from the cells below
-  local lnum = vim.api.nvim_win_get_cursor(0)[1]
-  local cell_id = nb:cell_at_line(lnum)
-  if not cell_id then return end
-  local cell = nb:get_cell(cell_id)
-  if not cell or #(cell.outputs or {}) == 0 then
-    vim.notify("jupynvim: no output on this cell", vim.log.levels.INFO)
-    return
-  end
-  local expanded = Notebook.toggle_output_expanded(cell_id)
-  M._populate_buffer(nb)
-  Render.refresh(nb, vim.fn.bufwinid(buf))
-  vim.notify("jupynvim: output " .. (expanded and "expanded" or "collapsed"),
-    vim.log.levels.INFO)
+  M._sync_model(nb)
+  local cell_id = nb:cell_at_line(vim.api.nvim_win_get_cursor(0)[1])
+  return nb, cell_id and nb:get_cell(cell_id) or nil
 end
 
+local function say(msg) vim.notify("jupynvim: " .. msg, vim.log.levels.INFO) end
+
+-- Rewrite one cell's output rows when it is expanded, cut again, hidden or
+-- shown, the way an output sync does, so the rest of the buffer and the
+-- language servers see no change. The notebook is the same, so 'modified' is
+-- too, and a buffer that matched the file still does in its new view.
+-- Rewritten plainly, it read as changed and :q refused to quit. 'modified'
+-- alone can say clean when it is not, because a repopulate resets it and
+-- TextChanged sets it back only after the keys that follow, so the text has
+-- to match as well.
+local function redraw_view(nb, cell)
+  local buf = nb.buf
+  local function text_hash()
+    return vim.fn.sha256(table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"))
+  end
+  local clean = not vim.bo[buf].modified and nb.saved_hash == text_hash()
+  M._apply_output_sync(nb, { [cell.id] = true })
+  if clean then
+    nb.saved_hash = text_hash()
+    vim.bo[buf].modified = false
+  else
+    vim.bo[buf].modified = true
+  end
+  -- a region this made shows its marker line until the render conceals it
+  local _, i = nb:get_cell(cell.id)
+  local r = i and require("jupynvim.notebook.cellmode").ranges(buf)[i]
+  if r and r.out_sep then conceal_seps(nb, r.out_sep, { Notebook.OUT_SEP }) end
+end
+
+-- Show all of the output under the cursor that the cap cut, or cut it again.
+-- With nothing cut there is nothing to do, and the message says so. It used
+-- to say "expanded" over a plot or a short print that never changed, #37.
+function M.toggle_output_expand(buf)
+  local nb, cell = cursor_cell(buf)
+  if not cell then return end
+  if cell._output_hidden and Notebook.output_shows(cell) then
+    local lhs = Keymaps.lhs_for("hide_output", M.config)
+    say("output is hidden" .. (lhs and (", " .. lhs .. " shows it") or ""))
+    return
+  end
+  local cut = Notebook.output_cut(cell)
+  if not cell._output_expanded then
+    if not cut then say("nothing to expand"); return end
+    cell._output_expanded = true
+  else
+    -- once the cap cuts nothing, being expanded changes no row
+    cell._output_expanded = nil
+    if not cut then say("nothing to collapse"); return end
+  end
+  redraw_view(nb, cell)
+  say(cell._output_expanded and "output expanded" or "output collapsed")
+end
+
+-- Hide the whole output under the cursor, plots included, behind one line
+-- saying what it holds, or show it again, the way JupyterLab and VS Code
+-- collapse an output, #37. Only the view changes, and the .ipynb keeps it all.
+function M.toggle_output_hidden(buf)
+  local nb, cell = cursor_cell(buf)
+  if not cell then return end
+  local shows = Notebook.output_shows(cell)
+  if not cell._output_hidden then
+    if not shows then say("nothing to hide"); return end
+    cell._output_hidden = true
+  else
+    -- a hidden cell with nothing to show looks the same either way
+    cell._output_hidden = nil
+    if not shows then say("nothing to show"); return end
+  end
+  redraw_view(nb, cell)
+  say(cell._output_hidden and "output hidden" or "output shown")
+end
+
+-- Ask how many first lines the output under the cursor shows, and show those
+-- and its last few, or show `n` when given. The number stays with the cell
+-- through runs and saves, and <leader>no toggles between it and every line.
+function M.limit_output(buf, n)
+  local nb, cell = cursor_cell(buf)
+  if not cell then return end
+  if cell.cell_type ~= "code" then say("not a code cell"); return end
+  local function apply(text)
+    text = vim.trim(tostring(text or ""))
+    if text == "" then return end   -- the prompt was left empty or cancelled
+    local want = tonumber(text)
+    if not want or want < 1 or want % 1 ~= 0 then
+      say("give a whole number of lines, like 100")
+      return
+    end
+    cell._output_limit, cell._output_expanded, cell._output_hidden = want, nil, nil
+    redraw_view(nb, cell)
+    -- the first lines and the last few can cover a short output whole
+    local total = Notebook.output_count(cell)
+    say(Notebook.output_cut(cell) and ("output cut to its first " .. want .. " lines")
+      or total == 0 and "nothing to cut yet"
+      or ("nothing to cut, it has %d line%s"):format(total, total == 1 and "" or "s"))
+  end
+  if n then return apply(n) end
+  local now = cell._output_limit or Notebook.max_output_lines
+  vim.ui.input({ prompt = ("Show how many lines%s? "):format(now > 0 and (" (now " .. now .. ")") or "") },
+    apply)
+end
+
+-- Compatibility shim for the old name; defaults to "down" direction.
 function M.toggle_output(buf) M.enter_output(buf, "down") end
 
 -- Jump cursor to the next or previous cell that contains an image, either as
@@ -2815,6 +2956,8 @@ function M.jump_image(buf, delta)
       local imgs = Embedded.list_images(cell.id) or {}
       if #imgs > 0 then return true end
     end
+    -- a hidden output shows no image to land on
+    if cell._output_hidden then return false end
     for _, o in ipairs(cell.outputs or {}) do
       local d = (o.output_type == "execute_result" or o.output_type == "display_data") and o.data or nil
       if d and (d["image/png"] or d["image/jpeg"] or d["image/gif"]) then return true end

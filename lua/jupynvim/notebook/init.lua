@@ -71,29 +71,36 @@ end
 -- DISPLAY ONLY: sync_from_buffer skips the output region entirely and saves
 -- read cell.outputs from the model, so nothing is lost from the .ipynb.
 M.max_output_lines = 500
-M._output_expanded = {}   -- cell_id -> true, per-cell "show it all"
+-- A cut output shows its first lines and this many of its last, as VS Code
+-- cuts one, so the end of a log or a closing error stays in view.
+M.OUTPUT_TAIL = 5
 
-function M.toggle_output_expanded(cell_id)
-  if not cell_id then return false end
-  M._output_expanded[cell_id] = not M._output_expanded[cell_id] or nil
-  return M._output_expanded[cell_id] == true
-end
+-- How a cell shows its outputs is kept on the cell table, so each notebook has
+-- its own even when two hold the same cell ids, as a copied .ipynb does. A
+-- save sends only ids, types and sources, so none of it reaches the file.
+--   cell._output_expanded  shows all of an output the cap cuts, <leader>no
+--   cell._output_hidden    shows one line for the whole output, <leader>nO
+--   cell._output_limit     how many first lines show, for this cell, <leader>nl
+-- Render puts the key to press after a marker line instead of in its text, so
+-- the buffer, and the undo file written from it, stay the same when keymaps
+-- change.
 
 -- Per-cell render cache. output_lines is called from to_lines, which the LSP
 -- diagnostic and didChange paths hit dozens of times per keystroke; on a
 -- notebook storing a 420KB `!tree` dump that was 27ms EVERY time and pegged the
 -- editor at ~97% of wall clock with the main loop starved.
 --
--- Weak keys so the entry dies with the cell and nothing is added to the cell
--- table itself (cells get serialised back to the backend; a cache field there
--- would leak into the .ipynb).
+-- Weak keys so the entry dies with the cell.
 local _ol_cache = setmetatable({}, { __mode = "k" })
 
 -- Cheap, content-derived key: O(#outputs) length lookups, no string scanning.
--- Covers every way outputs actually change - replaced wholesale (identity),
--- appended to by a stream event (text length), or added to (count).
+-- Within one output list, streams append text, new outputs change the count,
+-- and display-handle updates bump _rev. The cache also checks the list's
+-- identity, since a rerun can replace it with different text of the same
+-- length.
 local function _out_key(cell)
-  local p = { M.max_output_lines, M._output_expanded[cell.id] and 1 or 0 }
+  local p = { M.max_output_lines, cell._output_limit or 0, cell._output_expanded and 1 or 0,
+              cell._output_hidden and 1 or 0 }
   for _, o in ipairs(cell.outputs or {}) do
     local t, d = o.text, o.data
     p[#p + 1] = (o.output_type or "?") .. (o._rev or "")
@@ -108,12 +115,56 @@ local function _out_key(cell)
   return table.concat(p, ",")
 end
 
-function M.output_lines(cell)
-  local key = _out_key(cell)
-  local hit = _ol_cache[cell]
-  if hit and hit.key == key then return hit.lines end
+-- A marker line in place of the lines the cap hides.
+local function trunc_marker(hidden, total)
+  return string.format("  %s %d lines hidden (%d total)", M.OUT_TRUNC_MARK, hidden, total)
+end
 
+-- The rows a cell's outputs show, which of them are markers, whether the cap
+-- cut any lines, and how many lines the outputs have in all. `expanded`
+-- shows every line.
+local function build(cell, expanded)
+  local cap = not expanded and (cell._output_limit or M.max_output_lines) or nil
+  local head, tail, fit
+  if cap and cap > 0 then
+    head = math.floor(cap)
+    tail = M.OUTPUT_TAIL
+    fit = head + tail + 1   -- past this a cut hides 2 lines or more, never 1
+  end
+
+  local outputs = cell.outputs or {}
   local lines = {}
+  local hides = {}   -- row of a stream's marker -> the lines it hides
+  -- The text an execute_result or display_data shows. A figure's repr stays
+  -- hidden behind its image.
+  local function result_text(o)
+    local data = o.data or {}
+    local text = _as_str(data["text/plain"])
+    if (data["image/png"] or data["image/gif"] or data["image/jpeg"])
+        and (text == "" or text:match("^<[Ff]igure ")
+             or text:match("^<[%w._]+ object>$")
+             or text:match("^<[%w._]+ object at 0x[%x]+>$")) then
+      return ""
+    end
+    return text
+  end
+  -- Does any output after the i-th show more than blank lines? Blank rows at
+  -- the very end are dropped, so without one a stream's trailing blank lines
+  -- never show, and its marker must not count them.
+  local function more_after(i)
+    for j = i + 1, #outputs do
+      local o, t = outputs[j], ""
+      if o.output_type == "stream" then
+        t = _as_str(o.text)
+      elseif o.output_type == "execute_result" or o.output_type == "display_data" then
+        t = result_text(o)
+      elseif o.output_type == "error" then
+        t = _as_str(o.ename) .. _as_str(o.evalue) .. table.concat(vim.tbl_map(_as_str, o.traceback or {}))
+      end
+      if t:find("%S") and (not t:find("\27", 1, true) or _strip_ansi(t):find("%S")) then return true end
+    end
+    return false
+  end
   local function add_text(text)
     for _, l in ipairs(vim.split(text, "\n", { plain = true })) do
       if l:find("data:image/%w+;base64,") then
@@ -127,40 +178,34 @@ function M.output_lines(cell)
   -- expensive passes. _process_cr and _strip_ansi each walk the whole string,
   -- so running them over 420KB to emit 500 lines cost 17ms of the 23ms.
   -- Neither changes the line count, so slicing first is equivalent.
-  local cap = M.max_output_lines
-  local function add_stream(text)
-    if not (cap and cap > 0) or M._output_expanded[cell.id] then
+  local function add_stream(text, at)
+    if not fit then
       add_text(_strip_ansi(_process_cr(text))); return
     end
     local raw = vim.split(text, "\n", { plain = true })
-    if #raw <= cap then
+    local function row_text(i) return _strip_ansi(_process_cr((raw[i]:gsub("\r$", "")))) end
+    -- The newline that ends the last line starts no line of its own. Counted
+    -- as one, a 1000-line print read "1001 total", took a row of the tail
+    -- and hid one line more than it said.
+    if #raw > 1 and raw[#raw] == "" then raw[#raw] = nil end
+    if #raw > fit and not more_after(at) then
+      while #raw > 0 and row_text(#raw) == "" do raw[#raw] = nil end
+    end
+    if #raw <= fit then
       add_text(_strip_ansi(_process_cr(text))); return
     end
-    local head = math.max(1, math.floor(cap / 4))
-    local tail = math.max(1, cap - head - 1)   -- -1: the marker occupies a line
-    local function emit(i)
-      local l = raw[i]:gsub("\r$", "")
-      add_text(_strip_ansi(_process_cr(l)))
-    end
+    local function emit(i) add_text(row_text(i)) end
     for i = 1, head do emit(i) end
-    table.insert(lines, string.format(
-      "  %s %d lines hidden (%d total) - <leader>no to expand",
-      M.OUT_TRUNC_MARK, #raw - cap, #raw))
+    table.insert(lines, trunc_marker(#raw - head - tail, #raw))
+    hides[#lines] = #raw - head - tail
     for i = #raw - tail + 1, #raw do emit(i) end
   end
 
-  for _, o in ipairs(cell.outputs or {}) do
+  for i, o in ipairs(outputs) do
     if o.output_type == "stream" then
-      add_stream(_as_str(o.text))
+      add_stream(_as_str(o.text), i)
     elseif o.output_type == "execute_result" or o.output_type == "display_data" then
-      local data = o.data or {}
-      local has_img = data["image/png"] or data["image/gif"] or data["image/jpeg"]
-      local text = _as_str(data["text/plain"])
-      if has_img and (text == "" or text:match("^<[Ff]igure ")
-          or text:match("^<[%w._]+ object>$")
-          or text:match("^<[%w._]+ object at 0x[%x]+>$")) then
-        text = ""
-      end
+      local text = result_text(o)
       if text ~= "" then add_text(text) end
     elseif o.output_type == "error" then
       local msg = _as_str(o.ename) .. ": " .. _as_str(o.evalue)
@@ -172,22 +217,104 @@ function M.output_lines(cell)
   end
   while lines[#lines] == "  " or lines[#lines] == "" do table.remove(lines) end
 
-  -- Anything still over the cap (many outputs, or non-stream) is trimmed here,
-  -- keeping BOTH ends: for a training log the final epochs are the point.
-  if cap and cap > 0 and not M._output_expanded[cell.id] and #lines > cap then
-    local head = math.max(1, math.floor(cap / 4))
-    local tail = math.max(1, cap - head - 1)   -- -1: the marker occupies a line
+  -- How many lines rows a..b stand for. A row is one line, and a stream's
+  -- marker is every line it hides. Counted as rows, a marker that hid most
+  -- of a stream was one line.
+  local function count(a, b)
+    local n = math.max(0, b - a + 1)
+    for row, k in pairs(hides) do
+      if row >= a and row <= b then n = n + k - 1 end
+    end
+    return n
+  end
+  local total = count(1, #lines)
+  local marks = {}
+  for row in pairs(hides) do marks[row] = true end
+
+  -- Anything still over the cap (many outputs, or non-stream) is trimmed here
+  -- the same way, the first lines and the last few.
+  if fit and #lines > fit then
     local shown = {}
     for k = 1, head do shown[#shown + 1] = lines[k] end
-    shown[#shown + 1] = string.format(
-      "  %s %d lines hidden (%d total) - <leader>no to expand",
-      M.OUT_TRUNC_MARK, #lines - cap, #lines)
+    shown[#shown + 1] = trunc_marker(count(head + 1, #lines - tail), total)
     for k = #lines - tail + 1, #lines do shown[#shown + 1] = lines[k] end
-    lines = shown
+    -- a stream's marker sits in what was dropped, unless trailing blank lines
+    -- were cut from under it
+    local drop = #lines - tail - head - 1
+    local kept = { [head + 1] = true }
+    for row in pairs(hides) do
+      if row > #lines - tail then kept[row - drop] = true end
+    end
+    lines, marks = shown, kept
   end
+  return lines, marks, next(marks) ~= nil, total
+end
 
-  _ol_cache[cell] = { key = key, lines = lines }
-  return lines
+-- A hidden output shows one line in its place saying what it holds, or
+-- nothing when the outputs show nothing anyway.
+local function stand_in(cell)
+  local _, _, _, n = build(cell, false)
+  local imgs = 0
+  for _, o in ipairs(cell.outputs or {}) do
+    local d = (o.output_type == "execute_result" or o.output_type == "display_data") and o.data
+    if d and (d["image/png"] or d["image/gif"] or d["image/jpeg"]) then imgs = imgs + 1 end
+  end
+  local what = {}
+  if imgs > 0 then what[#what + 1] = imgs .. (imgs == 1 and " image" or " images") end
+  if n > 0 then what[#what + 1] = n .. (n == 1 and " line" or " lines") end
+  if #what == 0 then return {} end
+  return { string.format("  %s output hidden (%s)", M.OUT_TRUNC_MARK, table.concat(what, ", ")) }
+end
+
+local function cached(cell)
+  local key = _out_key(cell)
+  local hit = _ol_cache[cell]
+  -- A fast run can clear and refill outputs before the debounced render
+  -- observes the empty list. Lengths alone then match the previous run and
+  -- would keep displaying its result even though the kernel returned a new one.
+  if hit and hit.outputs == cell.outputs and hit.key == key then return hit end
+  local e = { key = key, outputs = cell.outputs }
+  if cell._output_hidden then
+    e.lines = stand_in(cell)
+    e.marks = #e.lines > 0 and { [1] = "hidden" } or {}
+  else
+    local marks
+    e.lines, marks, e.cut = build(cell, cell._output_expanded)
+    e.marks = {}
+    for row in pairs(marks) do e.marks[row] = "cut" end
+  end
+  _ol_cache[cell] = e
+  return e
+end
+
+function M.output_lines(cell)
+  return cached(cell).lines
+end
+
+-- The rows of output_lines(cell) that stand for something not shown, as
+-- row -> "cut" for lines the cap hides or "hidden" for a hidden output.
+function M.output_marks(cell)
+  return cached(cell).marks
+end
+
+-- Does the cap cut this cell's output when it is not expanded? Then
+-- <leader>no has lines to show, or to cut again.
+function M.output_cut(cell)
+  if not (cell._output_expanded or cell._output_hidden) then return cached(cell).cut end
+  local _, _, cut = build(cell, false)
+  return cut
+end
+
+-- How many lines the cell's outputs have in all, shown or not.
+function M.output_count(cell)
+  local _, _, _, n = build(cell, false)
+  return n
+end
+
+-- Does the cell show anything for its outputs, a line or an image? Then
+-- <leader>nO has something to hide.
+function M.output_shows(cell)
+  return cell.cell_type == "code" and #stand_in(cell) > 0
 end
 
 -- "2026-06-12T21:38:05.123Z" -> epoch seconds (fractional). Both stamps
@@ -392,8 +519,16 @@ end
 -- the separator below it, the same rule as CellMode.cell_idx_at. Output rows
 -- used to count as "between cells" and resolve to the NEXT cell, so running,
 -- clearing or saving from a cell's output acted on the cell after it.
+-- The layout comes from the buffer, not from to_lines. After :undo N or g-
+-- an output can still show as it was until the next edit puts it right.
+-- Laid out from the cells, every line below it named another cell, and a
+-- key acted on the wrong one.
 -- Returns id, range, index.
 function Notebook:cell_at_line(lnum)
+  if vim.api.nvim_buf_is_valid(self.buf) then
+    local i, r = require("jupynvim.notebook.cellmode").cell_idx_at(self.buf, lnum)
+    if self.cells[i] then return self.cells[i].id, r, i end
+  end
   local _, ranges = self:to_lines()
   for i = #ranges, 1, -1 do
     if lnum - 1 >= ranges[i].start then return ranges[i].id, ranges[i], i end
@@ -473,6 +608,10 @@ function Notebook:apply_cell_event(cell_id, ev)
   if kind == "execute_input" then
     c.execution_count = ev.execution_count
     c.outputs = {}
+    -- A new run is a new output, cut again. Kept on, expanding one long
+    -- print let the next run fill the buffer with whatever it printed. A
+    -- hidden output stays hidden, as JupyterLab keeps it collapsed.
+    c._output_expanded = nil
     -- start the execution stopwatch (drives the VSCode-style "[1] ✓ 0.1s"
     -- bar; live elapsed while busy, frozen duration once idle)
     self.cell_state[cell_id] = { exec_state = "busy", started_ns = vim.uv.hrtime() }

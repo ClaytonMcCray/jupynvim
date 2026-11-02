@@ -39,6 +39,8 @@ M.defaults = {
   interrupt_kernel = { mode = "n",          lhs = "<leader>ni", desc = "Interrupt kernel" },
   restart_kernel   = { mode = "n",          lhs = "<leader>nx", desc = "Restart kernel" },
   expand_output    = { mode = "n",          lhs = "<leader>no", desc = "Expand/collapse truncated output" },
+  hide_output      = { mode = "n",          lhs = "<leader>nO", desc = "Hide/show cell output" },
+  limit_output     = { mode = "n",          lhs = "<leader>nl", desc = "Show N lines of cell output" },
   clear_output     = { mode = "n",          lhs = "<leader>nc", desc = "Clear current cell output" },
   clear_all        = { mode = "n",          lhs = "<leader>nC", desc = "Clear all outputs" },
   next_cell        = { mode = "n",          lhs = "]c",         desc = "Next cell" },
@@ -77,6 +79,8 @@ local actions = {
   interrupt_kernel = function(buf, api) return function() api.interrupt_kernel(buf) end end,
   restart_kernel   = function(buf, api) return function() api.restart_kernel(buf) end end,
   expand_output    = function(buf, api) return function() api.toggle_output_expand(buf) end end,
+  hide_output      = function(buf, api) return function() api.toggle_output_hidden(buf) end end,
+  limit_output     = function(buf, api) return function() api.limit_output(buf) end end,
   clear_output     = function(buf, api) return function() api.clear_cell_output(buf) end end,
   clear_all        = function(buf, api) return function() api.clear_outputs(buf) end end,
   next_cell        = function(buf, api) return function() api.jump_cell(buf, 1) end end,
@@ -119,6 +123,20 @@ local function resolve(def, override)
     mode = vim.tbl_filter(function(m) return m ~= "i" end, mode)
   end
   return lhs, mode
+end
+
+-- The normal-mode key that `name` is bound to under `cfg`, for a hint like
+-- "<leader>no to expand". nil when this module does not bind it there.
+function M.lhs_for(name, cfg)
+  cfg = cfg or {}
+  local def = M.defaults[name]
+  if not def or cfg.disable_default_keymaps then return nil end
+  local lhs, mode = resolve(def, (cfg.keymaps or {})[name])
+  if lhs == nil then return nil end
+  -- an empty lhs fails to bind, and the default is bound instead
+  if type(lhs) ~= "string" or lhs == "" then lhs, mode = def.lhs, def.mode end
+  local modes = type(mode) == "table" and mode or { mode }
+  return vim.tbl_contains(modes, "n") and lhs or nil
 end
 
 local warned = {}

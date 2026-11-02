@@ -1,6 +1,6 @@
 # jupynvim
 
-[![release](https://img.shields.io/github/v/release/sheng-tse/jupynvim?include_prereleases&label=release&labelColor=24292f&color=F58426)](https://github.com/sheng-tse/jupynvim/releases)
+[![release](https://img.shields.io/github/v/release/sheng-tse/jupynvim?label=release&labelColor=24292f&color=F58426)](https://github.com/sheng-tse/jupynvim/releases)
 [![downloads](https://img.shields.io/github/downloads/sheng-tse/jupynvim/total?labelColor=24292f&color=006BB6)](https://github.com/sheng-tse/jupynvim/releases)
 [![license](https://img.shields.io/badge/license-MIT-006BB6?labelColor=24292f)](LICENSE)
 [![closed issues](https://img.shields.io/github/issues-closed/sheng-tse/jupynvim?labelColor=24292f&color=006BB6)](https://github.com/sheng-tse/jupynvim/issues?q=is%3Aissue+is%3Aclosed)
@@ -192,7 +192,7 @@ matched to the release the plugin came from:
 
 ```lua
 local function build(p) dofile(p.path .. "/lua/jupynvim/install.lua").run({ dir = p.path }) end
-MiniDeps.add({ source = "sheng-tse/jupynvim", checkout = "v0.4.5",
+MiniDeps.add({ source = "sheng-tse/jupynvim", checkout = "v0.4.6",
                hooks = { post_install = build, post_checkout = build } })
 ```
 
@@ -282,7 +282,7 @@ Once connected:
   back to the local equivalent.
 - **Terminals, VSCode-style.** A bottom PTY shell (`:JupynvimTerm` or
   `<C-/>`) and a second one on the right (`<leader>tr`) tile together, so you
-  can run a job in one and a tool like Claude Code in the other. Resize with
+  can run a job in one and keep working in the other. Resize with
   Shift+hjkl in normal mode (or Ctrl+arrows, also in insert). Both run on the
   remote, with vi editing on the shell prompt.
 - **Search.** `:JupynvimGrep <alias> <pattern> [<path>]` runs ripgrep on the
@@ -389,8 +389,18 @@ there.
 | `<leader>nI` | Save current cell's image to file |
 | `<leader>nD` | Delete an embedded image from a markdown cell |
 | `]i` or `[i` | Jump to next or prev cell with an image |
-| `<leader>no` | Expand or collapse a truncated output |
+| `<leader>no` | Show all of an output cut at `max_output_lines`, or cut it again |
+| `<leader>nO` | Hide a cell's whole output, plots included, or show it again |
+| `<leader>nl` | Set how many lines of a cell's output show. It asks for the number |
 | `gx` | Open the link under the cursor |
+
+A long output shows its first `max_output_lines` lines and its last 5, with
+a marker between them. `<leader>nl` gives one cell its own number, and
+`<leader>no` then toggles between that and every line. All of these change
+only the view. The `.ipynb` keeps every output and the notebook isn't marked
+modified. A hidden output and a cell's own number stay when the cell runs
+again, while a new run cuts an expanded output back. A notebook you save
+reopens with its outputs shown the same way, unless the file changed since.
 
 ### Kernel control
 
@@ -424,9 +434,10 @@ require("jupynvim").setup({
   image_rows = 16,
   image_cols = 48,
 
-  -- Longest output rendered per cell. A longer one shows its head and tail
-  -- with a marker between them, and <leader>no expands it. The .ipynb keeps
-  -- everything. 0 renders all of it.
+  -- How many lines of an output show. A longer one shows its first
+  -- max_output_lines lines and its last 5, with a marker between them, and
+  -- <leader>no expands it. <leader>nl sets another number for one cell. The
+  -- .ipynb keeps everything. 0 renders all of it.
   max_output_lines = 500,
 
   -- Override the path to the jupynvim-core binary. Auto-detected from the

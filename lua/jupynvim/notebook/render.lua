@@ -225,8 +225,11 @@ local OUT_INDENT = "  "
 -- slot keyed by the cell, so the render kept only the first while the live
 -- path kept overwriting it with the latest. gif > png > jpeg within one
 -- output, so a bundle carrying both animates.
-local function image_outputs(cell)
+local function image_outputs(nb, cell)
   local list = {}
+  -- a hidden output shows no image and holds none in the terminal, where a
+  -- gif would go on animating with nobody to see it
+  if cell._output_hidden then return list end
   for i, o in ipairs(cell.outputs or {}) do
     if o.output_type == "execute_result" or o.output_type == "display_data" then
       local data = o.data or {}
@@ -234,7 +237,8 @@ local function image_outputs(cell)
         local v = data[m]
         if type(v) == "table" then v = table.concat(v, "") end
         if type(v) == "string" and v ~= "" then
-          list[#list + 1] = { key = image.output_key(cell.id, i), b64 = v, mime = m }
+          list[#list + 1] = { key = image.output_key(image.output_owner(nb.buf, cell.id), i),
+                              b64 = v, mime = m }
           break
         end
       end
@@ -252,7 +256,7 @@ M._image_outputs = image_outputs
 local function build_image_virt_lines(cell, width, nb, lead)
   lead = (lead or "") .. OUT_INDENT
   local rows = {}
-  for n, img in ipairs(image_outputs(cell)) do
+  for n, img in ipairs(image_outputs(nb, cell)) do
     if n > 1 then table.insert(rows, { { lead, HL_OUTPUT } }) end
     local ph = image.placeholder_virt_lines(img.key)
     if ph then
@@ -515,10 +519,30 @@ local function render_cell(nb, cell, range, geom, win, cellno, selected, editing
         priority = 5000,
       })
     end
+    -- After a marker line, the key that shows what it stands for. It stays
+    -- out of the text because the undo file read back on the next open has
+    -- to match the buffer, and the keys can change in between.
+    local cfg = require("jupynvim").config
+    local K = require("jupynvim.notebook.keymaps")
+    for i, what in pairs(Notebook.output_marks(cell)) do
+      local row = range.out_sep + i
+      local lhs = K.lhs_for(what == "hidden" and "hide_output" or "expand_output", cfg)
+      local l = lhs and row < math.min(range.out_stop, total)
+        and vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1]
+      if l and l:find(Notebook.OUT_TRUNC_MARK, 1, true) == 3 then
+        pcall(vim.api.nvim_buf_set_extmark, buf, nb.border_ns, row, 0, {
+          virt_text = { { (" %s to %s"):format(lhs, what == "hidden" and "show" or "expand"), HL_MORE } },
+          virt_text_pos = "eol",
+          priority = 5001,
+        })
+      end
+    end
   end
 
   -- Schedule image placements for image outputs
-  if cell.cell_type == "code" and image.supported() then
+  local chafa_available = (require("jupynvim").config or {}).image_renderer == "chafa"
+    and vim.fn.executable("chafa") == 1
+  if cell.cell_type == "code" and (image.supported() or chafa_available) then
     M.place_images(nb, cell, range, win, gut)
   end
 end
@@ -527,11 +551,11 @@ end
 -- directly at the correct screen row using Kitty's a=T (transmit-and-place).
 function M.place_images(nb, cell, range, win, gut)
   nb.image_ids = nb.image_ids or {}
-  local imgs = image_outputs(cell)
+  local imgs = image_outputs(nb, cell)
   local keep = {}
   for _, img in ipairs(imgs) do keep[img.key] = true end
   -- outputs that are gone (a re-run with fewer plots, a clear) free theirs
-  for _, key in ipairs(image.clear_outputs_for_cell(cell.id, keep)) do
+  for _, key in ipairs(image.clear_outputs_for_cell(image.output_owner(nb.buf, cell.id), keep)) do
     nb.image_ids[key] = nil
   end
   if #imgs == 0 then return end
@@ -733,7 +757,7 @@ function M.setup_highlights()
   hl(0, HL_STREAM,     { default = true, link = "Normal" })           --unused
   hl(0, HL_RESULT,     { default = true, link = "Constant" })         --unused
   hl(0, HL_OK,         { default = true, link = "DiagnosticOk" })
-  hl(0, HL_MORE,       { default = true, link = "Comment" })          --unused
+  hl(0, HL_MORE,       { default = true, link = "Comment" })
   hl(0, HL_SEPARATOR,  { default = true, link = "WinSeparator" })     --unused
   -- Output regions render as plain TEXT (mask treesitter/LSP code colors).
   -- A whole block of output drawn in the theme's plain Normal can read as
