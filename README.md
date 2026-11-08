@@ -35,7 +35,9 @@ https://github.com/user-attachments/assets/2a3fbd17-561d-4c37-b856-a912944f88f8
   ImageMagick frame extraction.
 - Markdown cells render with their own highlight overlay. Embedded
   `data:image/...;base64,...` URIs get rewritten to short placeholders so the
-  buffer stays small while images still display.
+  buffer stays small while images still display. LaTeX math in `$..$`,
+  `$$..$$`, `\(..\)` and `\[..\]` is shown as readable Unicode text
+  (`∑ᵢ₌₁ⁿ xᵢ²`, `ℝⁿ → ℝ`); the source is untouched.
 - LSP that works on `.ipynb`. basedpyright, pyright, pylsp, or ruff attach
   with the kernel's interpreter so `numpy`, `matplotlib`, and project deps
   resolve. Diagnostics are scoped to code-cell line ranges so markdown text

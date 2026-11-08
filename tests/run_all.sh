@@ -27,7 +27,8 @@
 #      headless spec's output, so a failed spec names its failing checks)
 #   3. lua_e2e.lua (headless Neovim Lua tests)
 #   4. cellui_spec.lua (also the queued cells of a run and the release when
-#      a backend exits) + markdown_spec.lua + remote_hl_spec.lua (headless
+#      a backend exits) + markdown_spec.lua
+#      + mathtext_spec.lua (TeX -> terminal text) + remote_hl_spec.lua (headless
 #      render/UI specs) + remote_pick_open_spec.lua + remote_open_layout_spec.lua
 #      (window placement when opening a file from the remote explorer/picker)
 #      + dispatch_keys_spec.lua (global keys are session-only, issue #24)
@@ -356,6 +357,10 @@ md_out=$(nv --headless -u NONE -c "luafile $ROOT/tests/markdown_spec.lua" -c 'qa
 echo "$md_out" | grep -q "ALL MARKDOWN CHECKS PASSED"; rc=$?
 spec_out markdown_spec "$rc" "$md_out"
 section "markdown spec" "$rc"
+mt_out=$(nv --headless -u NONE -c "luafile $ROOT/tests/mathtext_spec.lua" -c 'qa!' 2>&1)
+echo "$mt_out" | grep -q "ALL MATHTEXT CHECKS PASSED"; rc=$?
+spec_out mathtext_spec "$rc" "$mt_out"
+section "mathtext spec" "$rc"
 co_out=$(nv --headless -u NONE -c "luafile $ROOT/tests/cellops_spec.lua" -c 'qa!' 2>&1)
 echo "$co_out" | grep -q "ALL CELL-OPS CHECKS PASSED"; rc=$?
 spec_out cellops_spec "$rc" "$co_out"
