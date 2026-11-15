@@ -35,9 +35,12 @@ https://github.com/user-attachments/assets/2a3fbd17-561d-4c37-b856-a912944f88f8
   ImageMagick frame extraction.
 - Markdown cells render with their own highlight overlay. Embedded
   `data:image/...;base64,...` URIs get rewritten to short placeholders so the
-  buffer stays small while images still display. LaTeX math in `$..$`,
-  `$$..$$`, `\(..\)` and `\[..\]` is shown as readable Unicode text
-  (`∑ᵢ₌₁ⁿ xᵢ²`, `ℝⁿ → ℝ`); the source is untouched.
+  buffer stays small while images still display. Display math (`$$..$$`,
+  `\[..\]`, `\begin{equation}..\end{equation}` and the other display
+  environments, and ```` ```math ```` blocks) is typeset with the KaTeX fonts
+  and shown as an image, the way Jupyter and VS Code show it. Inline math in
+  `$..$` and `\(..\)`, and any formula that cannot be an image, is shown as
+  readable Unicode text (`∑ᵢ₌₁ⁿ xᵢ²`, `ℝⁿ → ℝ`). The source is untouched.
 - LSP that works on `.ipynb`. basedpyright, pyright, pylsp, or ruff attach
   with the kernel's interpreter so `numpy`, `matplotlib`, and project deps
   resolve. Diagnostics are scoped to code-cell line ranges so markdown text
@@ -103,6 +106,13 @@ https://github.com/user-attachments/assets/2a3fbd17-561d-4c37-b856-a912944f88f8
   `jupynvim-core`. Neovim loads it through LuaJIT's FFI and runs heavy work
   on its worker threads, never on the UI thread. Without it, or on a Neovim
   built without LuaJIT, everything works as before.
+- Display math as images needs what inline images need (kitty or Ghostty,
+  `image_renderer = "placeholder"`) and `libjupynvim`, which typesets the
+  formulas. Where one is missing, math shows as readable text. A source
+  build of the library (`cargo build --release` in `core/`) downloads its
+  crates from crates.io the first time, the math typesetter and the PNG
+  encoder among them, so it needs a network once; the prebuilt library
+  needs nothing.
 - A Jupyter kernel installed for the language you intend to use. See below.
 - ImageMagick 7 (`magick`) is required for animated GIF playback. Static
   images work without it.
@@ -407,6 +417,7 @@ actually run.
 | `:JupynvimSaveImage [path]` | Save the current cell's image to disk. |
 | `:JupynvimDeleteImage` | Delete an embedded image from a markdown cell. |
 | `:JupynvimImageMode {placeholder\|kitty\|chafa}` | Switch image renderer at runtime. |
+| `:JupynvimMathMode {auto\|image\|text}` | Switch how display math shows at runtime: an image when everything it needs is there, an image even where jupynvim cannot tell, or text. |
 | `:JupynvimPauseAnimations` | Pause every GIF animation, or resume them when paused. |
 | `:JupynvimRenderStats` | Show the image write counters since the last call, then reset them. |
 | `:JupynvimReset` | Close every session and reopen every notebook on its own backend. |
@@ -511,6 +522,25 @@ require("jupynvim").setup({
   -- bump for sharper output on large terminals or shrink for compact display.
   image_rows = 16,
   image_cols = 48,
+
+  -- Display math ($$..$$, \[..\], \begin{equation}.. and ```math blocks) in markdown cells
+  -- is typeset by libjupynvim and shown as an image, like Jupyter and VS Code show it.
+  -- Inline math, and any formula that cannot be shown as an image, stays the readable
+  -- Unicode text.
+  --   renderer  "auto": an image when everything it needs is there (libjupynvim,
+  --             image_renderer = "placeholder", a kitty or Ghostty terminal, Neovim
+  --             0.12 or newer); "image": the same without asking about the terminal
+  --             and the Neovim version; "text": never an image.
+  --   scale     the size of the math: 1.0 makes one math em as tall as one line.
+  --   align     "left" (where the text rendering starts) or "center".
+  --   cell_px   { w, h }: the size of one terminal cell in pixels, when the terminal
+  --             does not tell it (some multiplexers). nil asks the terminal.
+  math = {
+    renderer = "auto",
+    scale = 1.0,
+    align = "left",
+    cell_px = nil,
+  },
 
   -- How many lines of an output show. A longer one shows its first
   -- max_output_lines lines and its last 5, with a marker between them, and
@@ -686,6 +716,14 @@ The palette is derived again when you change the colorscheme or `background`.
 canvas came from, and any setting that was ignored. The palette needs the
 in-process library (see Requirements); without it, colors stay as they are.
 
+Display math images are drawn in the foreground color of the
+`JupynvimMathImage` highlight group, which links to `JupynvimMdMathBlock`,
+the group of the math's text rendering, so a formula has the color of the
+text it replaces. `:hi JupynvimMathImage guifg=#ffffff` changes the ink of
+the images alone. The color is part of each image, on a transparent
+background, so a new colorscheme typesets the formulas again; they show as
+text for the moment that takes.
+
 ## How the LSP integration works
 
 Two non-obvious tricks make basedpyright behave on `.ipynb`.
@@ -771,6 +809,17 @@ event loop watches, so results reach Lua on the main loop as soon as they
 are ready, with no timer. Documents are passed by pointer rather than
 copied, and large results are read in place instead of being decoded on the
 UI thread, which is left to paint.
+
+Display math follows the same split. Each display block of a markdown cell
+is one job: on a worker thread, `libjupynvim` parses the TeX with RaTeX (a
+Rust port of KaTeX), lays it out, draws it with the KaTeX fonts it embeds,
+and returns a PNG that is a whole number of terminal cells wide and tall.
+Lua keeps the result by formula, transmits it once with the Kitty graphics
+protocol, and draws Unicode placeholders over the block's concealed source
+lines, where the terminal shows the image. Until the result is there, and
+whenever a formula cannot be typeset, the block keeps its text rendering. A
+render that finds every formula done costs a few table lookups and writes
+nothing to the terminal.
 
 ### Remote (SSH)
 
@@ -918,6 +967,34 @@ view, GIF frames only between screen redraws, and a refresh of the visible
 images at most once a second, once you stop typing. Neovim 0.12 writes images
 in order with the screen and does not have this problem.
 
+Math images are for display math on lines of its own. These stay readable
+text: inline math; display math inside a quote, a list item or a paragraph
+(`text $$x$$ text`); a block with text after its closing delimiter; a
+formula that uses `\ref` or `\eqref`; a formula with a character the KaTeX
+fonts do not have (CJK text, emoji); a formula wider than the window even at
+half its size (a slightly wide one is shrunk to fit); and anything else
+RaTeX cannot typeset (`multline` and `eqnarray` are rewritten to forms it
+can). Equations are not numbered, as in JupyterLab, and `\label` is dropped;
+an explicit `\tag{..}` still shows. Macros defined with `\newcommand`, `\def`
+and the like in a markdown cell apply to the formulas of that cell and of
+every cell below it, also when the definition sits in a code span, where
+Jupyter would skip it; a change to them reaches the cells below once you
+leave the cell's edit mode. A formula whose source line is wider than the
+window is drawn above that line, and the line's wrapped rows stay as blank
+rows under the image. A notebook opens with its math as text, and each
+formula turns into an image as its job finishes.
+
+The image's size comes from the size of a terminal cell in pixels, which
+jupynvim asks the terminal for. Inside tmux, over a remote UI, or in a
+terminal that reports no pixel size, it may get none or a wrong one: set
+`math.cell_px = { w = ..., h = ... }` to your cell size (`:checkhealth
+jupynvim` says which size is in use and where it came from). With
+`renderer = "auto"`, Neovim 0.11 shows math as text, because image writes
+there are not ordered with the screen (above) and a notebook's worth of
+formulas is sent at once; `renderer = "image"` turns them on anyway, which
+has not been tried on 0.11. `:JupynvimMathMode text` turns the images off
+for the session if they misbehave in your terminal.
+
 One local backend serves every local notebook, and each remote has one
 backend for its notebooks. `:JupynvimReset` reopens every notebook on its own
 backend, which restarts its kernel.
@@ -943,8 +1020,12 @@ in Neovim is a real workflow worth investing in. The Jupyter team
 documented an excellent
 [wire protocol](https://jupyter-client.readthedocs.io/en/stable/messaging.html).
 Kitty and Ghostty built the graphics protocol that makes terminal-native
-notebooks possible at all.
+notebooks possible at all. [KaTeX](https://katex.org)'s fonts and
+[RaTeX](https://github.com/erweixin/RaTeX)'s Rust port of its layout
+typeset the display math.
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](LICENSE). `libjupynvim` contains third-party Rust
+crates and the KaTeX fonts (SIL Open Font License 1.1); their licenses and
+copyright notices are in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
