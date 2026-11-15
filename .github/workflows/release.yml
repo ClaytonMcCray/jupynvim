@@ -173,6 +173,9 @@ jobs:
     needs: [build, build-lib]
     runs-on: ubuntu-latest
     steps:
+      # for THIRD_PARTY_NOTICES.md, published next to the binaries
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -186,6 +189,11 @@ jobs:
           cd artifacts
           sha256sum jupynvim-core-* libjupynvim-* > SHA256SUMS
           cat SHA256SUMS
+
+      # the licences of what libjupynvim contains; not a binary, so not in
+      # SHA256SUMS
+      - name: add the third-party notices
+        run: cp THIRD_PARTY_NOTICES.md artifacts/
 
       # A tag with a suffix, like v0.4.6-beta.1, is a pre-release, so GitHub
       # keeps pointing "latest" at the last stable one.
