@@ -668,7 +668,14 @@ end
 -- but staying dark, so an uncovered cell blends into the background. Override
 -- the base with setup({ image_placeholder_bg = "#rrggbb" }) when the theme is
 -- transparent and the fallback doesn't match the terminal background.
+--
+-- The ids go round after 24^3 = 13,824 allocations, and an image can live
+-- longer than that (a notebook's formulas each hold one), so an id that a
+-- placement still holds is skipped: a new image under a live id would show
+-- in the old one's cells. M._id_spread is the per-channel count (the spec
+-- makes the cycle small instead of making thousands of images).
 local NEXT_N = 0
+M._id_spread = 24
 local function next_image_id()
   local ok, cfg = pcall(function() return require("jupynvim").config end)
   local bg
@@ -679,12 +686,20 @@ local function next_image_id()
     local nrm = vim.api.nvim_get_hl(0, { name = "Normal" })
     bg = (type(nrm.bg) == "number") and (nrm.bg % 0x1000000) or 0x16161e
   end
-  local n = NEXT_N
-  NEXT_N = NEXT_N + 1
-  -- spread n across the three channels, each +0..23, so ids stay near the bg
-  local off = (n % 24) + (math.floor(n / 24) % 24) * 0x100 + (math.floor(n / 576) % 24) * 0x10000
-  local id = (bg + off) % 0x1000000
-  if id == 0 then id = 0x010101 end  -- never #000000 (Kitty reads it as "default")
+  local live = {}
+  for _, p in pairs(placements) do live[p.image_id] = true end
+  local k = M._id_spread
+  local id
+  for _ = 1, k * k * k do
+    local n = NEXT_N
+    NEXT_N = NEXT_N + 1
+    -- spread n across the three channels, each +0..k-1 (23), so ids stay near the bg
+    local off = (n % k) + (math.floor(n / k) % k) * 0x100 + (math.floor(n / (k * k)) % k) * 0x10000
+    id = (bg + off) % 0x1000000
+    if id == 0 then id = 0x010101 end  -- never #000000 (Kitty reads it as "default")
+    if not live[id] then return id end
+  end
+  -- every id of the cycle is held: the last one, as before ids were checked
   return id
 end
 
@@ -1634,10 +1649,12 @@ local gen = {}       -- key -> number of the newest transmit started for it
 -- Keyed on the request, the source bytes and the renderer asked for, not on
 -- what was stored: a jpeg or gif is stored as its converted png, and a failed
 -- conversion is stored as chafa, so comparing against the stored image missed
--- on every render and redid the work.
-function M.is_cached(cell_id, b64, renderer)
+-- on every render and redid the work. content_id, when given, names the
+-- content exactly and stands in for the sampled hash of b64 (as in
+-- ensure_transmitted's opts.content_id).
+function M.is_cached(cell_id, b64, renderer, content_id)
   local p = placements[cell_id]
-  return p ~= nil and p.src_hash == quick_hash(b64) and p.want == (renderer or "chafa")
+  return p ~= nil and p.src_hash == (content_id or quick_hash(b64)) and p.want == (renderer or "chafa")
 end
 
 -- A newer request for this key started while this one was being sent: free
@@ -1651,11 +1668,26 @@ local function superseded(cell_id, opts, id, callback)
   return false
 end
 
+-- opts.rows, opts.cols: the placeholder grid of this image (default: the
+-- configured size, see set_size), each clamped to 1..297, the most the
+-- placeholder diacritics can number.
+-- opts.content_id: a value that names this content exactly; it replaces the
+-- sampled hash of b64 as the identity of what the key shows, so two images
+-- whose base64 the hash cannot tell apart are still two images.
+local function grid(v, default)
+  v = tonumber(v)
+  if not v or v ~= v then return default end
+  v = math.floor(v)
+  if v < 1 then return 1 end
+  if v > 297 then return 297 end
+  return v
+end
+
 function M.ensure_transmitted(cell_id, b64, callback, opts)
   opts = opts or {}
   local renderer = opts.renderer or "chafa"
   local mime = opts.mime
-  local src_hash = opts._src_hash or quick_hash(b64)
+  local src_hash = opts._src_hash or opts.content_id or quick_hash(b64)
   local want = opts._want or renderer
   local existing = placements[cell_id]
   if existing and existing.src_hash == src_hash and existing.want == want then
@@ -1740,11 +1772,12 @@ function M.ensure_transmitted(cell_id, b64, callback, opts)
   if renderer == "placeholder" then
     -- Real PNG via Kitty Unicode placeholder protocol: the image stays
     -- anchored to buffer text because placeholders ARE text.
+    local rows, cols = grid(opts.rows, PLACEHOLDER_ROWS), grid(opts.cols, PLACEHOLDER_COLS)
     log.debug(string.format("placeholder: cell=%s id=%d transmitting %d b64 chars (%dx%d cells)",
-      cell_id, id, #b64, PLACEHOLDER_COLS, PLACEHOLDER_ROWS))
+      cell_id, id, #b64, cols, rows))
     local _, terr = kitty_call_sync("kitty_transmit_virtual", {
       image_id = id, png_b64 = b64,
-      cols = PLACEHOLDER_COLS, rows = PLACEHOLDER_ROWS,
+      cols = cols, rows = rows,
     })
     if terr then
       log.warn(string.format("placeholder: cell=%s id=%d transmit FAILED: %s", cell_id, id, tostring(terr)))
@@ -1755,14 +1788,14 @@ function M.ensure_transmitted(cell_id, b64, callback, opts)
     local p = {
       image_id = id, png_hash = h, b64 = b64, src_hash = src_hash, want = want,
       placement_id = 1, renderer = "placeholder",
-      rows = PLACEHOLDER_ROWS, cols = PLACEHOLDER_COLS,
+      rows = rows, cols = cols,
     }
     placements[cell_id] = p
     -- one-time cleanup: drop any anonymous placements this image id may
     -- have accumulated in the terminal (older sessions used a=T per
     -- frame), leaving exactly the explicit p=1 placement
     kitty_call_async("kitty_place_virtual", {
-      image_id = id, cols = PLACEHOLDER_COLS, rows = PLACEHOLDER_ROWS,
+      image_id = id, cols = cols, rows = rows,
     })
     p.placed_gen = M._place_gen
     log.debug(string.format("placeholder: cell=%s id=%d transmitted ok, fg=#%06x",
@@ -1843,6 +1876,47 @@ function M.placeholder_virt_lines(cell_id)
     table.insert(rows, { { cells_str, hl } })
   end
   return rows
+end
+
+-- Raised by every ColorScheme event (the autocmd at the end of this file):
+-- :hi clear wipes the JupynvimPH_<id> groups, so placeholder_rows sets each
+-- one again the next time it is asked for.
+local hl_epoch = 0
+
+-- The placeholder text of a transmitted placeholder image, one string per
+-- row, and the highlight group that carries its id. Nil when the key holds
+-- no placeholder image or, with content_id, holds other content. The table
+-- is built once per placement and cached on it: do not change it.
+-- Returns { hl = "JupynvimPH_<id>", rows = { [1..n] = string }, n = <rows>, cols = <cols> }.
+function M.placeholder_rows(key, content_id)
+  local p = placements[key]
+  if not p or p.renderer ~= "placeholder" or not p.rows or not p.cols then return nil end
+  if content_id ~= nil and p.src_hash ~= content_id then return nil end
+  local ph = p.ph
+  if not ph then
+    local cell = utf8(PLACEHOLDER)
+    local col_d = {}
+    for c = 1, p.cols do col_d[c] = utf8(DIACRITICS[c] or DIACRITICS[1]) end
+    local rows, parts = {}, {}
+    for r = 1, p.rows do
+      local lead = cell .. utf8(DIACRITICS[r] or DIACRITICS[1])
+      for c = 1, p.cols do parts[c] = lead .. col_d[c] end
+      rows[r] = table.concat(parts, "", 1, p.cols)
+    end
+    ph = { hl = "JupynvimPH_" .. p.image_id, rows = rows, n = p.rows, cols = p.cols }
+    p.ph = ph
+  end
+  if p.ph_epoch ~= hl_epoch then
+    -- the same colour rule as placeholder_virt_lines: the id is the fg
+    local id = p.image_id
+    local r = bit.band(bit.rshift(id, 16), 0xff)
+    local g = bit.band(bit.rshift(id, 8), 0xff)
+    local b = bit.band(id, 0xff)
+    if r == 0 and g == 0 and b == 0 then b = 1 end
+    vim.api.nvim_set_hl(0, ph.hl, { fg = string.format("#%02x%02x%02x", r, g, b) })
+    p.ph_epoch = hl_epoch
+  end
+  return ph
 end
 
 -- Get the ASCII-art lines for a cell (or nil if direct placement was used).
@@ -2190,6 +2264,12 @@ vim.api.nvim_create_autocmd("TermResponse", {
 vim.api.nvim_create_autocmd({ "WinScrolled", "BufWinEnter", "TabEnter" }, {
   group = aug,
   callback = function() if next(placements) then pcall(M._catch_up) end end,
+})
+-- :hi clear (every :colorscheme) wipes the placeholder groups: the next
+-- placeholder_rows sets them again (see hl_epoch)
+vim.api.nvim_create_autocmd("ColorScheme", {
+  group = aug,
+  callback = function() hl_epoch = hl_epoch + 1 end,
 })
 
 return M
