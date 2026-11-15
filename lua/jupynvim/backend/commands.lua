@@ -145,12 +145,39 @@ function Commands.install(M, Image)
     end
     M.config.image_renderer = mode
     pcall(function() require("jupynvim.notebook.image").clear_all() end)
+    -- the display-math images went with clear_all; forget them, so the next
+    -- render decides again under the new renderer
+    pcall(function() require("jupynvim.notebook.mathimage").reset() end)
     for buf, nb in pairs(Notebook.all()) do
       nb.image_ids = {}
       Render.refresh(nb, vim.fn.bufwinid(buf))
     end
     vim.notify("jupynvim image_renderer = " .. mode, vim.log.levels.INFO)
   end, { nargs = 1, complete = function() return { "chafa", "kitty", "placeholder" } end })
+
+  -- :JupynvimMathMode auto|image|text: how display math in markdown cells is
+  -- shown in this session (math.renderer in setup()). "text" is the one-line
+  -- way back to the Unicode text rendering when images misbehave.
+  vim.api.nvim_create_user_command("JupynvimMathMode", function(o)
+    local mode = o.args:match("^%s*(%S+)%s*$") or ""
+    if mode ~= "auto" and mode ~= "image" and mode ~= "text" then
+      vim.notify("Usage: :JupynvimMathMode auto|image|text", vim.log.levels.WARN)
+      return
+    end
+    if type(M.config.math) ~= "table" then M.config.math = {} end
+    M.config.math.renderer = mode
+    local ok, MI = pcall(require, "jupynvim.notebook.mathimage")
+    if not (ok and type(MI) == "table" and type(MI.setup) == "function") then
+      vim.notify("jupynvim: math images are not available; math shows as text", vim.log.levels.WARN)
+      return
+    end
+    pcall(MI.setup, M.config.math)
+    if type(MI.reset) == "function" then pcall(MI.reset) end
+    for buf, nb in pairs(Notebook.all()) do
+      Render.refresh(nb, vim.fn.bufwinid(buf))
+    end
+    vim.notify("jupynvim math renderer = " .. mode, vim.log.levels.INFO)
+  end, { nargs = 1, complete = function() return { "auto", "image", "text" } end })
 
   vim.api.nvim_create_user_command("JupynvimSaveImage", function(o)
     M.save_image(vim.api.nvim_get_current_buf(), o.args)

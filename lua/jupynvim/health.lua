@@ -103,6 +103,117 @@ function M._palette(h)
   for _, what in ipairs(r.ignored) do h.warn("palette: ignored " .. what) end
 end
 
+-- The ink colour a math image would have: "#rrggbb", as the math module
+-- reports it, else from the highlight groups it reads.
+local function math_fg(st)
+  if type(st.fg) == "string" and st.fg:match("^#%x%x%x%x%x%x$") then return st.fg end
+  for _, name in ipairs({ "JupynvimMathImage", "JupynvimMdMathBlock", "Normal" }) do
+    local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = name, link = false, create = false })
+    if ok and type(hl) == "table" and type(hl.fg) == "number" then
+      return ("#%06x"):format(hl.fg % 0x1000000)
+    end
+  end
+  return vim.o.background == "light" and "#24292e" or "#d0d0d0"
+end
+
+-- Display math shown as images (lua/jupynvim/notebook/mathimage.lua): can a
+-- formula be an image here, and if not, why. Its own section, after the
+-- palette's, with the palette's gate: it reports only on a library that is
+-- up, and it loads nothing. Its one typeset (x^2) runs on this thread; it is
+-- the only synchronous typeset the plugin makes.
+function M._math(h)
+  h.start("jupynvim: math images")
+  local okm, MI = pcall(require, "jupynvim.notebook.mathimage")
+  if not (okm and type(MI) == "table" and type(MI.status) == "function") then
+    h.info("math images are not available in this version; display math shows as text")
+    return
+  end
+  local okn, N = pcall(require, "jupynvim.native")
+  local state = okn and N.status().state or nil
+  if state ~= "ok" then
+    if state == "unloaded" then
+      h.info("math images: libjupynvim is still being opened for the first time; run :checkhealth jupynvim again")
+    else
+      h.info("math images: needs libjupynvim; without it math shows as text")
+    end
+    return
+  end
+  local kind = N.KIND and N.KIND.MATH
+  local okk, sup = pcall(function() return kind and N.lib().jnv_kind_supported(kind) end)
+  if not (kind and okk and tonumber(sup) == 1) then
+    h.warn("math images: this libjupynvim cannot typeset math; math shows as text",
+      { "Update the library: :JupynvimInstall, or cargo build --release in core/" })
+    return
+  end
+  local oks, st = pcall(MI.status)
+  if not (oks and type(st) == "table") then
+    h.warn("math images: the module's status failed: " .. tostring(st))
+    return
+  end
+  local renderer = st.renderer
+  if renderer == "text" then
+    h.info("math images are turned off (math.renderer = \"text\")")
+    return
+  end
+  h.info(("math.renderer = %q"):format(tostring(renderer)))
+  local jc = require("jupynvim").config or {}
+  if jc.image_renderer ~= "placeholder" then
+    h.info(("math images need image_renderer = \"placeholder\" (it is %q); math shows as text"):format(
+      tostring(jc.image_renderer)))
+  end
+  if renderer == "auto" then
+    local oki, Image = pcall(require, "jupynvim.notebook.image")
+    if oki and type(Image.supported) == "function" and not Image.supported() then
+      h.info("the terminal is not kitty or Ghostty, so math.renderer = \"auto\" shows math as text"
+        .. " (\"image\" skips this check)")
+    end
+    if vim.api.nvim_ui_send == nil then
+      h.info("Neovim 0.11: math.renderer = \"auto\" shows math as text on Neovim older than 0.12"
+        .. " (\"image\" turns images on anyway)")
+    end
+  end
+  -- the cell size: measured when the module has not done it yet
+  if type(st.cell) ~= "table" and type(MI.refresh_cell_px) == "function" then
+    pcall(MI.refresh_cell_px)
+    local ok2, st2 = pcall(MI.status)
+    if ok2 and type(st2) == "table" then st = st2 end
+  end
+  local cell = type(st.cell) == "table" and st.cell or {}
+  local w, ht = tonumber(cell.w), tonumber(cell.h)
+  if not (w and ht) then
+    local nominal = type(MI._nominal) == "table" and MI._nominal or {}
+    w, ht = tonumber(nominal.w) or 18, tonumber(nominal.h) or 40
+  end
+  if cell.source == "terminal" then
+    h.ok(("cell %dx%d px, from the terminal"):format(w, ht))
+  elseif cell.source == "config" then
+    h.ok(("cell %dx%d px, from math.cell_px"):format(w, ht))
+  else
+    h.warn(("the terminal reports no cell size in pixels; using %dx%d"):format(w, ht),
+      { "Set math.cell_px = { w = ..., h = ... } in setup()" })
+  end
+  -- a typeset of x^2 at that cell size
+  local cfg = type(jc.math) == "table" and jc.math or {}
+  local scale = tonumber(cfg.scale)
+  if not (scale and scale >= 0.5 and scale <= 3) then scale = 1 end
+  local tex = "x^2"
+  local req = ("JNM 1\nfg %s\ncell %d %d\nscale %s\nmax %d %d\npre 0\ntex %d\n\n%s"):format(
+    math_fg(st), w, ht, tostring(scale), 297, 60, #tex, tex)
+  local t0 = vim.uv.hrtime()
+  local okc, ok, out = pcall(N.call, kind, req)
+  local ms = (vim.uv.hrtime() - t0) / 1e6
+  if okc and ok then
+    local cols, rows = tostring(out):match("\ngrid (%d+) (%d+)\n")
+    if cols then
+      h.ok(("typeset probe: %sx%s cells in %.1f ms"):format(cols, rows, ms))
+    else
+      h.warn("typeset probe: the library's answer has no grid line")
+    end
+  else
+    h.warn("typeset probe failed: " .. tostring(okc and out or ok))
+  end
+end
+
 function M.check()
   local h = vim.health
   local J = require("jupynvim")
@@ -147,6 +258,7 @@ function M.check()
 
   M._library(h, J, Install)
   M._palette(h)
+  M._math(h)
 
   h.start("jupynvim: installing the prebuilt")
   local tag = want and ("v" .. want)
