@@ -383,11 +383,34 @@ local function footer_chunks(total_w, gut, bc, label, cell, st, border_hl)
 end
 M._footer_chunks = footer_chunks
 
+-- The display-math image module (lua/jupynvim/notebook/mathimage.lua), or
+-- nil when it is not there. Looked up once. Every call into it goes through
+-- pcall: an error there costs the images of a render, never a cell.
+local mathimage_mod
+function M._mathimage()
+  if mathimage_mod == nil then
+    local ok, mod = pcall(require, "jupynvim.notebook.mathimage")
+    mathimage_mod = ok and type(mod) == "table" and mod or false
+    if not ok and not tostring(mod):find("module 'jupynvim.notebook.mathimage' not found", 1, true) then
+      log.warn("math images: the module failed to load: " .. tostring(mod))
+    end
+  end
+  return mathimage_mod or nil
+end
+
+-- Call MI[name](...) through pcall when the module has that function:
+-- ok, result.
+local function mi_call(MI, name, ...)
+  if not (MI and type(MI[name]) == "function") then return false, nil end
+  return pcall(MI[name], ...)
+end
+
 -- Render a single cell. `geom` = { gut, width, total_w }: statuscolumn
 -- width, text-area width, full window width. `editing` = this cell is the
 -- one being edited (markdown cells get a source-editor box while edited,
--- like VSCode's markdown edit view).
-local function render_cell(nb, cell, range, geom, win, cellno, selected, editing)
+-- like VSCode's markdown edit view). `mctx` is the math image module's
+-- context for this render, or nil.
+local function render_cell(nb, cell, range, geom, win, cellno, selected, editing, mctx)
   local buf = nb.buf
   local st = nb.cell_state[cell.id]
   local busy = st and st.exec_state == "busy"
@@ -435,14 +458,27 @@ local function render_cell(nb, cell, range, geom, win, cellno, selected, editing
     local last = math.max(range.stop - 1, range.start)
     if last >= total then last = total - 1 end
     if last >= 0 then
-      vim.api.nvim_buf_set_extmark(buf, nb.border_ns, last, 0, {
+      -- At the END of the last line, not column 0: virtual lines of one line
+      -- show in column order, so the rows markdown.render hangs at column 0
+      -- of this line (a table's bottom border, a formula's image rows) come
+      -- before this cell's own rows. For marks at one column the order is
+      -- not fixed. A line that ends a table or a formula is never empty.
+      local last_text = vim.api.nvim_buf_get_lines(buf, last, last + 1, false)[1] or ""
+      vim.api.nvim_buf_set_extmark(buf, nb.border_ns, last, #last_text, {
         virt_lines = lines_below,
         virt_lines_leftcol = true,
       })
     end
     if cell.cell_type == "markdown" then
+      local MI = mctx and M._mathimage()
+      local cctx
+      if MI then
+        local okc, got = mi_call(MI, "cell", mctx, cell, cellno)
+        if okc then cctx = got end
+      end
       require("jupynvim.notebook.markdown").render(buf, nb.border_ns,
-        range.start, math.min(range.stop - 1, total - 1), width)
+        range.start, math.min(range.stop - 1, total - 1), width, cctx)
+      if cctx then mi_call(MI, "cell_done", cctx) end
       local Embedded = require("jupynvim.notebook.embedded")
       local imgs = Embedded.list_images(cell.id)
       if imgs and #imgs > 0 then
@@ -895,18 +931,28 @@ local function do_render(nb, win, opts)
   local sel_idx = CellMode.selected_idx(buf)
   local edit_idx = (not CellMode.is_command(buf)) and sel_idx or nil
 
+  -- Display math as images: the module's context for this render, or nil
+  -- (no module, math images off, or an error there: every block is text).
+  local MI = M._mathimage()
+  local mctx
+  if MI and type(MI.begin) == "function" then
+    local okb, got = pcall(MI.begin, nb, win, edit_idx)
+    if okb then mctx = got else log.warn("math images: " .. tostring(got)) end
+  end
+
   -- Clear + rebuild in one synchronous pass so no half-state is ever shown.
   vim.api.nvim_buf_clear_namespace(buf, nb.border_ns, 0, -1)
   for i, r in ipairs(ranges) do
     local cell = nb.cells[i]
     if cell then
       local ok, err = pcall(render_cell, nb, cell, r, geom, win, i,
-        i == sel_idx, i == edit_idx)
+        i == sel_idx, i == edit_idx, mctx)
       if not ok then
         require("jupynvim.log").warn("render_cell failed for cell " .. tostring(i) .. ": " .. tostring(err))
       end
     end
   end
+  if mctx then mi_call(MI, "finish", mctx) end
   clear_separators(nb, ranges)
   manage_busy_ticker(nb)
   -- re-assert image placements: only those whose placement generation moved
