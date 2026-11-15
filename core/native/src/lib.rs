@@ -21,6 +21,7 @@
 pub mod abi;
 pub mod jobs;
 pub mod mathgrammar;
+pub mod mathimage;
 pub mod palette;
 pub mod panic;
 pub mod pool;
@@ -48,7 +49,7 @@ pub struct JnvCtx {
 /// of the process.
 static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
-/// `(major << 16) | minor`: ABI 1.1.
+/// `(major << 16) | minor`: ABI 1.2.
 #[no_mangle]
 pub extern "C" fn jnv_abi_version() -> u32 {
     guard(|| (abi::ABI_MAJOR << 16) | abi::ABI_MINOR).unwrap_or(0)

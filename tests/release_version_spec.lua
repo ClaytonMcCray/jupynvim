@@ -176,7 +176,7 @@ case("R4", function()
   end
   local function probe_says(dir, version)
     write_file(dir .. "/lua/jupynvim/backend/native_probe.lua",
-      ('io.write("jnv-probe ok %s 1.1\\n")\n'):format(version))
+      ('io.write("jnv-probe ok %s 1.2\\n")\n'):format(version))
   end
   local P = plugin("lib-beta", BETA)
   probe_says(P, BETA)

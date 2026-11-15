@@ -8,14 +8,15 @@
  * Every export is type-checked against the header's prototype at compile
  * time, so a header that drifts from this program fails to build. At run
  * time it checks the ABI major, the version (when given), the struct sizes,
- * a call on the calling thread, a caught panic, a worker round trip through
- * the wake fd, that jnv_close ends the wake fd and frees the descriptors a
- * context holds, every NULL-handle answer, that no buffer is left, and that
- * the library stays mapped after dlclose (it must never be unloaded while
- * its worker threads may run). Prints "ok <check>" or "FAIL <check>" per
- * check, then "ALL ABI CHECKS PASSED" (exit 0) or "<n> ABI CHECKS FAILED"
- * (exit 1). C99 plus POSIX and RTLD_NOLOAD (an extension every target's
- * libc has; on Linux it needs _GNU_SOURCE, defined below).
+ * a call on the calling thread, that a formula typesets (the math kind), a
+ * caught panic, a worker round trip through the wake fd, that jnv_close
+ * ends the wake fd and frees the descriptors a context holds, every
+ * NULL-handle answer, that no buffer is left, and that the library stays
+ * mapped after dlclose (it must never be unloaded while its worker threads
+ * may run). Prints "ok <check>" or "FAIL <check>" per check, then
+ * "ALL ABI CHECKS PASSED" (exit 0) or "<n> ABI CHECKS FAILED" (exit 1).
+ * C99 plus POSIX and RTLD_NOLOAD (an extension every target's libc has; on
+ * Linux it needs _GNU_SOURCE, defined below).
  */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE 1
@@ -111,6 +112,15 @@ static int buf_contains(const jnv_buf *b, const char *needle) {
     return 0;
 }
 
+/* The length of the buffer's first line, at most cap bytes: what of a
+ * result fits on one line of this program's output. */
+static int first_line_len(const jnv_buf *b, size_t cap) {
+    if (b == NULL || b->ptr == NULL) return 0;
+    size_t n = 0;
+    while (n < b->len && n < cap && b->ptr[n] != '\n') n++;
+    return (int)n;
+}
+
 /* Open descriptors of this process, counted over 0 to 4095 (a new
  * descriptor takes the lowest free number). */
 static int open_fds(void) {
@@ -201,6 +211,7 @@ int main(int argc, char **argv) {
     check(p_sizeof(JNV_SIZEOF_DONE) == sizeof(jnv_done), what);
 
     check(p_kind_supported(JNV_KIND_ECHO) == 1, "jnv_kind_supported(ECHO) == 1");
+    check(p_kind_supported(JNV_KIND_MATH) == 1, "jnv_kind_supported(MATH) == 1");
     check(p_kind_supported(0) == 0, "jnv_kind_supported(0) == 0");
 
     jnv_buf *err = NULL;
@@ -220,6 +231,17 @@ int main(int argc, char **argv) {
         jnv_buf *out = NULL;
         int32_t st = p_call(ctx, JNV_KIND_ECHO, "abc", 3, &out);
         check(st == JNV_OK && buf_is(out, "abc", 3), "jnv_call ECHO \"abc\"");
+        p_buf_free(out);
+
+        /* The library really typesets: one formula through the C ABI gives
+         * the response head, also for a library built for another target. */
+        static const char math_req[] = "JNM 1\nfg #c0caf5\ncell 10 20\nscale 1\nmax 297 60\npre 0\ntex 3\n\nx^2";
+        out = NULL;
+        st = p_call(ctx, JNV_KIND_MATH, math_req, sizeof math_req - 1, &out);
+        snprintf(what, sizeof what, "jnv_call MATH \"x^2\" gives a typeset (status %d, result %.*s)", (int)st,
+                 first_line_len(out, 120), out ? (const char *)out->ptr : "");
+        check(st == JNV_OK && out != NULL && out->ptr != NULL && out->len >= 6 && memcmp(out->ptr, "JNM 1\n", 6) == 0,
+              what);
         p_buf_free(out);
 
         out = NULL;

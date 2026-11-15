@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # What the repo's .gitignore keeps out of git, checked in a scratch git repo
 # that has only that file. The sources of the fake libraries the native tests
-# load (core/native/examples/) must be tracked: without them a fresh clone or
-# CI cannot run cargo test. The top-level examples/ playground, where people
-# drop their own notebooks, and the build output must stay ignored.
+# load (core/native/examples/) and the fonts the library embeds
+# (core/native/fonts/katex/) must be tracked: without them a fresh clone or
+# CI cannot run cargo test or build the library. The top-level examples/
+# playground, where people drop their own notebooks, and the build output
+# must stay ignored.
 #
 #   bash tests/gitignore_spec.sh
 set -u
@@ -21,8 +23,9 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 
 git init -q "$D" || { echo "FAIL git init"; exit 1; }
 cp "$ROOT/.gitignore" "$D/.gitignore" || { echo "FAIL copy .gitignore"; exit 1; }
-mkdir -p "$D/core/native/examples" "$D/examples" "$D/core/target"
+mkdir -p "$D/core/native/examples" "$D/core/native/fonts/katex" "$D/examples" "$D/core/target"
 : > "$D/core/native/examples/jnv_fake.rs"
+: > "$D/core/native/fonts/katex/KaTeX_Main-Regular.ttf"
 : > "$D/examples/demo.ipynb"
 : > "$D/core/target/x"
 
@@ -41,6 +44,7 @@ chk_ignored() {
 }
 
 chk_ignored "core/native/examples/jnv_fake.rs is tracked" core/native/examples/jnv_fake.rs 1
+chk_ignored "core/native/fonts/katex/KaTeX_Main-Regular.ttf is tracked" core/native/fonts/katex/KaTeX_Main-Regular.ttf 1
 chk_ignored "the top-level examples playground stays ignored" examples/demo.ipynb 0
 chk_ignored "build output stays ignored" core/target/x 0
 
