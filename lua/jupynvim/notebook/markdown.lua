@@ -33,6 +33,10 @@ local HL = {
   Check = "JupynvimMdCheck",
   TableBorder = "JupynvimMdTableBorder",
   TableHead = "JupynvimMdTableHead",
+  -- The ink of a display formula shown as an image: its resolved foreground
+  -- is the colour the formula is drawn in, so by default an image has the
+  -- colour of the text rendering it replaces.
+  MathImage = "JupynvimMathImage",
 }
 
 function M.setup_hl()
@@ -52,6 +56,7 @@ function M.setup_hl()
   hl(0, HL.HR,          { default = true, link = "@markup.delimiter" })
   hl(0, HL.Math,        { default = true, link = "@markup.math" })
   hl(0, HL.MathBlock,   { default = true, link = "@markup.math" })
+  hl(0, HL.MathImage,   { default = true, link = HL.MathBlock })
   hl(0, HL.Strike,      { default = true, link = "@markup.strikethrough" })
   hl(0, HL.Check,       { default = true, link = "@markup.list.checked" })
   hl(0, HL.TableBorder, { default = true, link = "Normal" })
@@ -618,13 +623,16 @@ local function inline_styling(buf, ns, lnum, line, all_spans, escaped)
   end
 end
 
-local function apply_line(buf, ns, lnum, raw)
+-- `on_display`, when given, is offered a line that is one display span
+-- alone: on_display(inner, lnum) returns true when it drew the line itself.
+local function apply_line(buf, ns, lnum, raw, on_display)
   if raw == "" then return end
   -- A line that is exactly one display span ($$..$$ or \[..\]) renders as
   -- a block line; mid-paragraph display spans go through inline_styling.
   local spans, escaped = M.find_math_spans(raw)
   if #spans == 1 and spans[1].display
      and trim(raw) == raw:sub(spans[1].start, spans[1].stop) then
+    if on_display and on_display(spans[1].inner, lnum) then return end
     math_block_line(buf, ns, lnum, raw, spans[1].inner)
     return
   end
@@ -916,6 +924,74 @@ local function render_table(buf, ns, base, lines, first, last, max_w)
   end
 end
 
+-- ---------- display math as an image ----------
+
+local unpack_args = unpack or table.unpack
+
+-- Can place_block draw `img`: whole rows >= 1 and columns >= 1, a highlight
+-- group, and one row string for every row?
+local function valid_image(img)
+  if type(img) ~= "table" or type(img.hl) ~= "string" or type(img.text) ~= "table" then
+    return false
+  end
+  local R, C = img.rows, img.cols
+  if type(R) ~= "number" or R < 1 or R % 1 ~= 0 then return false end
+  if type(C) ~= "number" or C < 1 or C % 1 ~= 0 then return false end
+  for r = 1, R do
+    if type(img.text[r]) ~= "string" then return false end
+  end
+  return true
+end
+
+-- Show the display block on lines[first..last] (1-based; line i is buffer
+-- row base + i - 1) as the image `img` of img.rows rows. Every source line
+-- is concealed, delimiter lines too. The image rows lie over the lines, one
+-- row per line: centred in the block when it has more lines than rows, so
+-- the block keeps the height its text rendering had, and with the rows the
+-- lines cannot hold hanging below the last line. Those virtual lines are at
+-- column 0, which puts them before the cell's own rows on that line (their
+-- mark is at the end of it). A concealed line wider than the window still
+-- takes all its wrapped rows, so then, and always when `overlay` is false,
+-- every image row goes above the block and the concealed lines stay as
+-- blank rows under it (the table renderer's pattern). Placeholder cells are
+-- drawn with hl_mode "replace": the terminal reads the image from their
+-- colours, which no other highlight may change.
+local function place_block(buf, ns, base, lines, first, last, img, width, align, overlay)
+  local S, R = last - first + 1, img.rows
+  local indent = dw(lines[first]:match("^%s*"))
+  local pad = indent
+  if align == "center" then pad = math.max(indent, math.floor((width - img.cols) / 2)) end
+  local function chunks(r)
+    if pad > 0 then return { { string.rep(" ", pad), "Normal" }, { img.text[r], img.hl } } end
+    return { { img.text[r], img.hl } }
+  end
+  local fits = overlay ~= false
+  for i = first, last do
+    local raw = lines[i]
+    if #raw > 0 then
+      set_mark(buf, ns, base + i - 1, 0, { end_col = #raw, conceal = "", priority = 150 })
+      if fits and dw(raw) > width then fits = false end
+    end
+  end
+  if not fits then
+    local vls = {}
+    for r = 1, R do vls[r] = chunks(r) end
+    set_mark(buf, ns, base + first - 1, 0, { virt_lines = vls, virt_lines_above = true })
+    return
+  end
+  local top = S > R and math.floor((S - R) / 2) or 0
+  for k = 1, math.min(R, S) do
+    set_mark(buf, ns, base + first + top + k - 2, 0, {
+      virt_text = chunks(k), virt_text_pos = "overlay", hl_mode = "replace", priority = 160,
+    })
+  end
+  if R > S then
+    local below = {}
+    for r = S + 1, R do below[#below + 1] = chunks(r) end
+    set_mark(buf, ns, base + last - 1, 0, { virt_lines = below })
+  end
+end
+
 -- ---------- public API ----------
 
 local MATH_FENCE = "^%s*[`~][`~][`~]+%s*[Mm][Aa][Tt][Hh]%s*$"
@@ -937,7 +1013,24 @@ end
 -- Apply markdown extmarks to lines [start_line, end_line] (0-based, inclusive)
 -- in `buf`, in namespace `ns`. Multi-line constructs (fenced code blocks,
 -- block math) are tracked via a small state machine.
-function M.render(buf, ns, start_line, end_line, render_width)
+--
+-- `ctx` is optional; without it the marks are the text rendering, always.
+-- With it, every display-math block that stands alone (`$$..$$`, `\[..\]`, a
+-- display environment, a ```math fence, closed, with nothing after its
+-- closer, and with no table row or other fence inside) is offered to
+-- ctx.math_block(tex, spec):
+--   tex   the block's TeX without its delimiters, its lines joined by "\n"
+--         (a display environment keeps its \begin and \end)
+--   spec  { first, last = 0-based buffer rows of the block's first and last
+--           line, indent = display width of the first line's leading white
+--           space, width = render_width }
+-- It answers nil for the text rendering, or an image
+-- { rows = R, cols = C, hl = <group>, text = { <row string> x R } } that is
+-- drawn in place of the block (place_block). ctx.align is "left" (at the
+-- block's indent) or "center"; ctx.overlay = false puts every image row in
+-- virtual lines above the block instead of over its lines.
+function M.render(buf, ns, start_line, end_line, render_width, ctx)
+  if type(ctx) ~= "table" or type(ctx.math_block) ~= "function" then ctx = nil end
   if not vim.api.nvim_buf_is_valid(buf) then return end
   local total = vim.api.nvim_buf_line_count(buf)
   if start_line >= total then return end
@@ -980,32 +1073,100 @@ function M.render(buf, ns, start_line, end_line, render_width)
   -- name of a bare environment. nil outside a block.
   local math_close = nil
 
+  -- With a ctx, the open display block: { first = line index, kind = "$$" |
+  -- "]" | "env" | "fence", tex = { TeX pieces }, acts = { kept marks },
+  -- ok = false once something that is not math is inside it }. The text
+  -- marks of its lines are kept, not made, until it closes: then they are
+  -- made, or dropped for an image. Only set where the code below opens a
+  -- block and only cleared where it closes one, so it always agrees with
+  -- math_close and in_fence. Without a ctx it is never set.
+  local blk = nil
+  local width = render_width or 80
+
+  -- Make a mark now, or keep it (with its arguments) for the open block.
+  local function act(fn, ...)
+    if blk then
+      blk.acts[#blk.acts + 1] = { fn, select("#", ...), ... }
+    else
+      fn(...)
+    end
+  end
+  local function replay(b)
+    for _, a in ipairs(b.acts) do a[1](unpack_args(a, 3, a[2] + 2)) end
+  end
+
+  -- Ask ctx for an image of lines[first..last] holding `tex`; place it and
+  -- return true when one comes. Through pcall: an error on the image path
+  -- leaves the text rendering.
+  local function ask(first, last, tex)
+    if blank(tex) then return false end
+    local okm, img = pcall(ctx.math_block, tex, {
+      first = start_line + first - 1, last = start_line + last - 1,
+      indent = dw(lines[first]:match("^%s*")), width = width })
+    if not (okm and valid_image(img)) then return false end
+    place_block(buf, ns, start_line, lines, first, last, img, width, ctx.align, ctx.overlay)
+    return true
+  end
+
+  -- The open block ends on line index i. `eligible`: it closed with nothing
+  -- after its closer.
+  local function close_block(i, eligible)
+    local b = blk
+    blk = nil
+    if eligible and b.ok and ask(b.first, i, table.concat(b.tex, "\n")) then return end
+    replay(b)
+  end
+
+  -- A line that is one display span alone ($$x$$, \[x\], a one-line
+  -- \begin{equation}x\end{equation}).
+  local on_display = ctx and function(inner, lnum)
+    local i = lnum - start_line + 1
+    return ask(i, i, inner)
+  end
+
   for i, raw in ipairs(lines) do
     local lnum = start_line + i - 1
     if claimed[i] then
       -- table row: already rendered by the pre-pass
+      if blk then blk.ok = false end
       goto continue
     end
     do
       -- Fenced code blocks take priority over everything, as before.
       local is_fence, ch, is_math = fence_line(raw, in_fence, fence_ch)
       if is_fence then
+        local opens = not in_fence
         if in_fence then
           in_fence, fence_ch, fence_math = false, nil, false
         else
           in_fence, fence_ch, fence_math = true, ch, is_math
         end
-        set_mark(buf, ns, lnum, 0, {
+        local opts = {
           line_hl_group = HL.Code,
           virt_text = { { string.rep("─", 60), HL.Code } },
           virt_text_pos = "overlay",
           conceal = "",
           hl_mode = "combine",
           priority = 110,
-        })
+        }
+        if blk and (opens or blk.kind ~= "fence") then
+          -- a fence inside a $$, \[ or environment block: that block is text
+          blk.ok = false
+          set_mark(buf, ns, lnum, 0, opts)
+        elseif blk then
+          -- the closing fence of a ```math block
+          act(set_mark, buf, ns, lnum, 0, opts)
+          close_block(i, true)
+        else
+          if opens and is_math and ctx then
+            blk = { first = i, kind = "fence", tex = {}, acts = {}, ok = true }
+          end
+          act(set_mark, buf, ns, lnum, 0, opts)
+        end
       elseif in_fence then
         if fence_math then
-          math_block_line(buf, ns, lnum, raw)
+          if blk then blk.tex[#blk.tex + 1] = raw end
+          act(math_block_line, buf, ns, lnum, raw)
         else
           set_mark(buf, ns, lnum, 0, { line_hl_group = HL.Code, priority = 100 })
         end
@@ -1013,9 +1174,13 @@ function M.render(buf, ns, start_line, end_line, render_width)
         local p = raw:find("$$", 1, true)
         if p then
           math_close = nil
-          math_closer_line(buf, ns, lnum, raw, raw:sub(1, p - 1), p + 1)
+          local tex = raw:sub(1, p - 1)
+          if blk and not blank(tex) then blk.tex[#blk.tex + 1] = tex end
+          act(math_closer_line, buf, ns, lnum, raw, tex, p + 1)
+          if blk then close_block(i, blank(raw:sub(p + 2))) end
         else
-          math_block_line(buf, ns, lnum, raw)
+          if blk then blk.tex[#blk.tex + 1] = raw end
+          act(math_block_line, buf, ns, lnum, raw)
         end
       elseif math_close == "]" then
         -- `\]` or `\\]` anywhere on the line closes, like `$$` and \end{env}
@@ -1023,9 +1188,13 @@ function M.render(buf, ns, start_line, end_line, render_width)
         if p then
           math_close = nil
           local ds = (p > 1 and raw:byte(p - 1) == BS) and p - 1 or p
-          math_closer_line(buf, ns, lnum, raw, raw:sub(1, ds - 1), p + 1)
+          local tex = raw:sub(1, ds - 1)
+          if blk and not blank(tex) then blk.tex[#blk.tex + 1] = tex end
+          act(math_closer_line, buf, ns, lnum, raw, tex, p + 1)
+          if blk then close_block(i, blank(raw:sub(p + 2))) end
         else
-          math_block_line(buf, ns, lnum, raw)
+          if blk then blk.tex[#blk.tex + 1] = raw end
+          act(math_block_line, buf, ns, lnum, raw)
         end
       elseif math_close then
         local needle = "\\end{" .. math_close .. "}"
@@ -1033,9 +1202,12 @@ function M.render(buf, ns, start_line, end_line, render_width)
         if p then
           math_close = nil
           local de = p + #needle - 1
-          math_closer_line(buf, ns, lnum, raw, raw:sub(1, de), de)
+          if blk then blk.tex[#blk.tex + 1] = raw:sub(1, de) end
+          act(math_closer_line, buf, ns, lnum, raw, raw:sub(1, de), de)
+          if blk then close_block(i, blank(raw:sub(de + 1))) end
         else
-          math_block_line(buf, ns, lnum, raw)
+          if blk then blk.tex[#blk.tex + 1] = raw end
+          act(math_block_line, buf, ns, lnum, raw)
         end
       else
         local dollar_rest = raw:match("^%s*%$%$(.*)$")
@@ -1043,18 +1215,22 @@ function M.render(buf, ns, start_line, end_line, render_width)
         if dollar_rest and not dollar_rest:find("$$", 1, true) then
           -- $$ opener; content on the same line (`$$ a`) is rendered
           math_close = "$$"
+          if ctx then blk = { first = i, kind = "$$", tex = {}, acts = {}, ok = true } end
           if blank(dollar_rest) then
-            set_mark(buf, ns, lnum, 0, { line_hl_group = HL.MathBlock, priority = 110 })
+            act(set_mark, buf, ns, lnum, 0, { line_hl_group = HL.MathBlock, priority = 110 })
           else
-            math_block_line(buf, ns, lnum, raw, dollar_rest)
+            if blk then blk.tex[1] = dollar_rest end
+            act(math_block_line, buf, ns, lnum, raw, dollar_rest)
           end
         elseif raw:match("^%s*\\\\?%[%s*$") then
           math_close = "]"
-          set_mark(buf, ns, lnum, 0, { line_hl_group = HL.MathBlock, priority = 110 })
+          if ctx then blk = { first = i, kind = "]", tex = {}, acts = {}, ok = true } end
+          act(set_mark, buf, ns, lnum, 0, { line_hl_group = HL.MathBlock, priority = 110 })
         elseif env and DISPLAY_ENVS[env]
                and not raw:find("\\end{" .. env .. "}", 1, true) then
           math_close = env
-          math_block_line(buf, ns, lnum, raw)
+          if ctx then blk = { first = i, kind = "env", tex = { raw }, acts = {}, ok = true } end
+          act(math_block_line, buf, ns, lnum, raw)
         else
           -- Setext headings: text line followed by `===` (h1) or `---` (h2).
           -- Style the text line as a heading; fully conceal the underline below.
@@ -1074,13 +1250,19 @@ function M.render(buf, ns, start_line, end_line, render_width)
               priority = 200,
             })
           else
-            apply_line(buf, ns, lnum, raw)
+            apply_line(buf, ns, lnum, raw, on_display)
             -- ATX heading: NO underline virt_line. The styled heading text speaks for itself.
           end
         end
       end
     end
     ::continue::
+  end
+  -- a block still open at the end of the cell never closed: it is text
+  if blk then
+    local b = blk
+    blk = nil
+    replay(b)
   end
 end
 

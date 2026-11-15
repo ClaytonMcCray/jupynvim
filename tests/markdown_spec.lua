@@ -361,5 +361,446 @@ do
 end
 print("5f. one-line bare environment ok")
 
+-- 6. display math offered to a ctx (math_block) and placed as an image.
+-- A fake ctx records every call and answers from a function of the TeX.
+local function fake_ctx(answer, extra)
+  local calls = {}
+  local ctx = {
+    align = "left",
+    math_block = function(tex, spec)
+      calls[#calls + 1] = { tex, spec }
+      return answer(tex)
+    end,
+  }
+  for k, v in pairs(extra or {}) do ctx[k] = v end
+  return ctx, calls
+end
+local function never() return nil end
+local function image(R, C)
+  local text = {}
+  for r = 1, R do text[r] = "r" .. r end
+  return { rows = R, cols = C or 10, hl = "TestPH", text = text }
+end
+-- `ls` in a new buffer, rendered from row `from` (default 0) with `ctx`
+local function render_ctx(ls, ctx, width, from)
+  local b = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_lines(b, 0, -1, false, ls)
+  MD.render(b, ns, from or 0, #ls - 1, width or 80, ctx)
+  return b, vim.api.nvim_buf_get_extmarks(b, ns, 0, -1, { details = true })
+end
+-- the marks as a sorted list of "row:col:details" (ids left out)
+local function mark_list(ms)
+  local out = {}
+  for _, m in ipairs(ms) do out[#out + 1] = ("%d:%d:%s"):format(m[2], m[3], vim.inspect(m[4])) end
+  table.sort(out)
+  return out
+end
+local function same_marks(a, b)
+  if #a ~= #b then return false, ("%d marks against %d"):format(#a, #b) end
+  for i = 1, #a do
+    if a[i] ~= b[i] then return false, "first difference: " .. a[i] .. "  vs  " .. b[i] end
+  end
+  return true
+end
+-- the text rendering of `ls`, without a ctx
+local function text_marks(ls, width, from)
+  local b, ms = render_ctx(ls, nil, width, from)
+  vim.api.nvim_buf_delete(b, { force = true })
+  return mark_list(ms)
+end
+
+-- 6a. identity: a ctx that always answers nil gives exactly the marks of no ctx
+local every_kind = {
+  "# Blocks of every kind",
+  "$$", "x^2", "$$",
+  "$$ a", "b", "c $$",
+  "\\[", "\\int_0^1 f", "\\]",
+  "\\\\[", "y", "\\\\]",
+  "\\begin{align}", "a &= b \\\\", "c &= d", "\\end{align}",
+  "```math", "\\sqrt{2}", "```",
+  "~~~math", "\\frac{1}{2}", "~~~",
+  "$$x$$", "  \\[x\\]", "\\begin{equation}x\\end{equation}",
+  "$$", "z", "$$ then prose",
+  "$$", "| a | b |", "|---|---|", "| 1 | 2 |", "$$",
+  "$$", "```", "code", "```", "$$",
+  "$$", "```math", "w", "```", "$$",
+  "> $$", "- $$x$$", "text $$x$$ text", "inline $x$ and \\(y\\)",
+  "```python", "print(1)", "```",
+  "| h | k |", "|---|---|", "| 1 | 2 |",
+  "heading", "---",
+  "$$", "never closed",
+}
+do
+  local ctx, calls = fake_ctx(never)
+  local b, ms = render_ctx(every_kind, ctx)
+  local ok, why = same_marks(mark_list(ms), text_marks(every_kind))
+  assert(ok, "6a. a ctx answering nil changed the marks: " .. tostring(why))
+  vim.api.nvim_buf_delete(b, { force = true })
+  local want = {
+    "x^2", " a\nb\nc ", "\\int_0^1 f", "y", "\\begin{align}\na &= b \\\\\nc &= d\n\\end{align}",
+    "\\sqrt{2}", "\\frac{1}{2}", "x", "x", "\\begin{equation}x\\end{equation}",
+  }
+  local got = {}
+  for i, c in ipairs(calls) do got[i] = c[1] end
+  assert(#got == #want, "6a. asked " .. #got .. " blocks, want " .. #want .. ": " .. vim.inspect(got))
+  for i = 1, #want do
+    assert(got[i] == want[i], ("6a. ask %d: %q, want %q"):format(i, got[i], want[i]))
+  end
+  -- the sections above, and the whole markdown fixture, the same way
+  for name, ls in pairs({ section4 = mcontent, fixture = flines, section3 = content }) do
+    local fctx = fake_ctx(never)
+    local fb, fms = render_ctx(ls, fctx)
+    local same, fwhy = same_marks(mark_list(fms), text_marks(ls))
+    assert(same, "6a. " .. name .. ": a ctx answering nil changed the marks: " .. tostring(fwhy))
+    vim.api.nvim_buf_delete(fb, { force = true })
+  end
+  -- a ctx without math_block, or not a table, is no ctx
+  for _, bad in ipairs({ {}, { math_block = true }, 42 }) do
+    local bb, bms = render_ctx(every_kind, bad)
+    assert(same_marks(mark_list(bms), text_marks(every_kind)), "6a. a ctx with no math_block changed the marks")
+    vim.api.nvim_buf_delete(bb, { force = true })
+  end
+end
+print("6a. a ctx answering nil keeps the text rendering, mark for mark ok")
+
+-- 6b. what is asked: the TeX and the spec
+local function asks(ls, width, from)
+  local ctx, calls = fake_ctx(never)
+  local b = render_ctx(ls, ctx, width, from)
+  vim.api.nvim_buf_delete(b, { force = true })
+  return calls
+end
+local function spec_is(c, first, last, indent, width, what)
+  local s = c[2]
+  assert(s.first == first and s.last == last and s.indent == indent and s.width == width,
+    ("6b. %s: spec %s, want first %d last %d indent %d width %d"):format(
+      what, vim.inspect(s), first, last, indent, width))
+end
+do
+  local c = asks({ "intro", "$$", "x", "$$" })
+  assert(#c == 1 and c[1][1] == "x", "6b. $$ / x / $$ asked " .. vim.inspect(c))
+  spec_is(c[1], 1, 3, 0, 80, "$$ / x / $$")
+  c = asks({ "$$a", "b", "c$$" })
+  assert(#c == 1 and c[1][1] == "a\nb\nc", "6b. $$a / b / c$$ asked " .. vim.inspect(c))
+  -- the text next to the delimiters is kept as it is (a trailing `\ ` is TeX)
+  c = asks({ "$$ a", "b", "c $$" })
+  assert(#c == 1 and c[1][1] == " a\nb\nc ", "6b. $$ a / b / c $$ asked " .. vim.inspect(c))
+  spec_is(c[1], 0, 2, 0, 80, "$$ a / b / c $$")
+  c = asks({ "\\[", "x", "\\]" })
+  assert(#c == 1 and c[1][1] == "x", "6b. \\[ / x / \\] asked " .. vim.inspect(c))
+  spec_is(c[1], 0, 2, 0, 80, "\\[ block")
+  c = asks({ "\\\\[", "x", "\\\\]" })
+  assert(#c == 1 and c[1][1] == "x", "6b. \\\\[ / x / \\\\] asked " .. vim.inspect(c))
+  c = asks({ "\\begin{align}", "a &= b", "\\end{align}" })
+  assert(#c == 1 and c[1][1] == "\\begin{align}\na &= b\n\\end{align}",
+    "6b. align asked " .. vim.inspect(c))
+  spec_is(c[1], 0, 2, 0, 80, "align")
+  c = asks({ "```math", "\\sqrt{2}", "```" })
+  assert(#c == 1 and c[1][1] == "\\sqrt{2}", "6b. ```math asked " .. vim.inspect(c))
+  spec_is(c[1], 0, 2, 0, 80, "```math")
+  c = asks({ "~~~math", "a", "b", "~~~" })
+  assert(#c == 1 and c[1][1] == "a\nb", "6b. ~~~math asked " .. vim.inspect(c))
+  c = asks({ "$$x$$", "\\[x\\]", "\\begin{equation}x\\end{equation}" })
+  assert(#c == 3, "6b. three one-line blocks asked " .. #c .. " times")
+  assert(c[1][1] == "x" and c[2][1] == "x" and c[3][1] == "\\begin{equation}x\\end{equation}",
+    "6b. one-line blocks asked " .. vim.inspect(c))
+  for i = 1, 3 do spec_is(c[i], i - 1, i - 1, 0, 80, "one-line block " .. i) end
+  c = asks({ "   $$", "   x", "   $$" })
+  spec_is(c[1], 0, 2, 3, 80, "indented $$ block")
+  c = asks({ "  $$x$$" })
+  spec_is(c[1], 0, 0, 2, 80, "indented one-line block")
+  c = asks({ "a", "b", "$$", "x", "$$" }, 60, 2)
+  assert(#c == 1, "6b. a range from row 2 asked " .. #c .. " times")
+  spec_is(c[1], 2, 4, 0, 60, "a range from row 2")
+  c = asks({ "$$", "x", "$$" }, nil)
+  spec_is(c[1], 0, 2, 0, 80, "no width")
+end
+print("6b. what is asked: TeX, rows, indent, width ok")
+
+-- 6c. what is never asked; each stays the text rendering
+do
+  for _, ls in ipairs({
+    { "$$", "x", "$$ and prose" },
+    { "\\[", "x", "\\] so it" },
+    { "\\begin{equation}", "x", "\\end{equation} text" },
+    { "$$", "x" },
+    { "\\begin{align}", "x" },
+    { "```math", "x" },
+    { "$$", "| a | b |", "|---|---|", "$$" },
+    { "$$", "```", "x", "```", "$$" },
+    { "$$", "", "$$" },
+    { "\\[ \\]" },
+    { "> $$x$$" },
+    { "> $$", "> x", "> $$" },
+    { "- $$x$$" },
+    { "1. $$x$$" },
+    { "text $$x$$ text" },
+    { "inline $x$ here" },
+    { "\\(x\\)" },
+    { "$$x$$", "---" },
+  }) do
+    local ctx, calls = fake_ctx(function() return image(1) end)
+    local b, ms = render_ctx(ls, ctx)
+    assert(#calls == 0, "6c. asked for " .. vim.inspect(ls) .. ": " .. vim.inspect(calls))
+    assert(same_marks(mark_list(ms), text_marks(ls)), "6c. marks changed for " .. vim.inspect(ls))
+    vim.api.nvim_buf_delete(b, { force = true })
+  end
+end
+print("6c. never asked: prose after closer, unclosed, table or fence inside, quote, list, paragraph, inline ok")
+
+-- 6d. placement, mark by mark. The calls are recorded as they are made, so
+-- what nvim_buf_get_extmarks does not return (priority) is checked too.
+local function placed(ls, R, opts)
+  opts = opts or {}
+  local rec = {}
+  local real = vim.api.nvim_buf_set_extmark
+  vim.api.nvim_buf_set_extmark = function(b, n, row, col, o)
+    rec[#rec + 1] = { row = row, col = col, o = o }
+    return real(b, n, row, col, o)
+  end
+  local ctx, calls = fake_ctx(function() return image(R, opts.cols) end,
+    { align = opts.align, overlay = opts.overlay })
+  local ok, b = pcall(render_ctx, ls, ctx, opts.width or 80)
+  vim.api.nvim_buf_set_extmark = real
+  assert(ok, b)
+  vim.api.nvim_buf_delete(b, { force = true })
+  assert(#calls == 1, "6d. asked " .. #calls .. " times for " .. vim.inspect(ls))
+  local k = { conceal = {}, overlay = {}, below = {}, above = {}, other = {} }
+  for _, m in ipairs(rec) do
+    local o = m.o
+    -- no text marks under an image: nothing inline, no line highlight
+    assert(o.virt_text_pos ~= "inline" and o.line_hl_group == nil,
+      "6d. a text mark under an image: " .. vim.inspect(m))
+    assert(m.col == 0, "6d. a mark not at column 0: " .. vim.inspect(m))
+    if o.conceal ~= nil then k.conceal[#k.conceal + 1] = m
+    elseif o.virt_text_pos == "overlay" then k.overlay[#k.overlay + 1] = m
+    elseif o.virt_lines and o.virt_lines_above then k.above[#k.above + 1] = m
+    elseif o.virt_lines then k.below[#k.below + 1] = m
+    else k.other[#k.other + 1] = m end
+  end
+  assert(#k.other == 0, "6d. unexpected marks: " .. vim.inspect(k.other))
+  -- every non-empty source line concealed whole, at priority 150
+  local want_conceal = 0
+  for i, l in ipairs(ls) do
+    if #l > 0 then
+      want_conceal = want_conceal + 1
+      local found = false
+      for _, m in ipairs(k.conceal) do
+        if m.row == i - 1 then
+          assert(m.o.end_col == #l and m.o.conceal == "" and m.o.priority == 150,
+            "6d. conceal of row " .. (i - 1) .. " wrong: " .. vim.inspect(m))
+          found = true
+        end
+      end
+      assert(found, "6d. row " .. (i - 1) .. " not concealed")
+    end
+  end
+  assert(#k.conceal == want_conceal, "6d. " .. #k.conceal .. " conceal marks, want " .. want_conceal)
+  return k
+end
+local function overlay_ok(m, row, chunks, what)
+  assert(m.row == row, ("6d. %s: overlay on row %d, want %d"):format(what, m.row, row))
+  assert(m.o.virt_text_pos == "overlay" and m.o.hl_mode == "replace" and m.o.priority == 160,
+    "6d. " .. what .. ": overlay options wrong: " .. vim.inspect(m.o))
+  assert(vim.deep_equal(m.o.virt_text, chunks),
+    "6d. " .. what .. ": chunks " .. vim.inspect(m.o.virt_text) .. ", want " .. vim.inspect(chunks))
+end
+local function rows_of(vls)
+  local out = {}
+  for i, vl in ipairs(vls) do out[i] = vl[#vl][1] end
+  return table.concat(out, ",")
+end
+do
+  -- S 3, R 1: the row over the middle line, no virtual lines
+  local k = placed({ "$$", "x", "$$" }, 1)
+  assert(#k.overlay == 1 and #k.below == 0 and #k.above == 0, "6d. S3 R1: " .. vim.inspect(k))
+  overlay_ok(k.overlay[1], 1, { { "r1", "TestPH" } }, "S3 R1")
+  -- S 3, R 3: one row over each line, in order
+  k = placed({ "\\[", "\\frac{a}{b}", "\\]" }, 3)
+  assert(#k.overlay == 3 and #k.below == 0 and #k.above == 0, "6d. S3 R3: " .. vim.inspect(k))
+  table.sort(k.overlay, function(a, b) return a.row < b.row end)
+  for r = 1, 3 do overlay_ok(k.overlay[r], r - 1, { { "r" .. r, "TestPH" } }, "S3 R3 row " .. r) end
+  -- S 1, R 3: one row over the line, two virtual lines under it
+  k = placed({ "$$\\frac{a}{b}$$" }, 3)
+  assert(#k.overlay == 1 and #k.below == 1 and #k.above == 0, "6d. S1 R3: " .. vim.inspect(k))
+  overlay_ok(k.overlay[1], 0, { { "r1", "TestPH" } }, "S1 R3")
+  local below = k.below[1]
+  assert(below.row == 0 and not below.o.virt_lines_above and not below.o.virt_lines_leftcol
+    and rows_of(below.o.virt_lines) == "r2,r3", "6d. S1 R3 virtual lines wrong: " .. vim.inspect(below))
+  -- S 5, R 2: rows over lines 2 and 3, centred
+  k = placed({ "$$", "a", "b", "c", "$$" }, 2)
+  assert(#k.overlay == 2 and #k.below == 0 and #k.above == 0, "6d. S5 R2: " .. vim.inspect(k))
+  table.sort(k.overlay, function(a, b) return a.row < b.row end)
+  overlay_ok(k.overlay[1], 1, { { "r1", "TestPH" } }, "S5 R2 first")
+  overlay_ok(k.overlay[2], 2, { { "r2", "TestPH" } }, "S5 R2 second")
+  -- an empty line inside the block takes a row like any other
+  k = placed({ "$$", "", "x", "$$" }, 1)
+  assert(#k.overlay == 1, "6d. S4 R1: " .. vim.inspect(k))
+  overlay_ok(k.overlay[1], 1, { { "r1", "TestPH" } }, "S4 R1 (empty line)")
+  -- a 200-character line at width 80 wraps: every row above the block
+  k = placed({ "$$", string.rep("x", 200), "$$" }, 2)
+  assert(#k.overlay == 0 and #k.below == 0 and #k.above == 1, "6d. wide line: " .. vim.inspect(k))
+  assert(k.above[1].row == 0 and rows_of(k.above[1].o.virt_lines) == "r1,r2",
+    "6d. wide line: virtual lines above wrong: " .. vim.inspect(k.above[1]))
+  -- an indented block starts at its indent
+  k = placed({ "  $$", "  x", "  $$" }, 1)
+  overlay_ok(k.overlay[1], 1, { { "  ", "Normal" }, { "r1", "TestPH" } }, "indented")
+  k = placed({ "  $$x$$" }, 2)
+  overlay_ok(k.overlay[1], 0, { { "  ", "Normal" }, { "r1", "TestPH" } }, "indented one-line")
+  assert(vim.deep_equal(k.below[1].o.virt_lines, { { { "  ", "Normal" }, { "r2", "TestPH" } } }),
+    "6d. indented one-line: virtual line chunks wrong: " .. vim.inspect(k.below[1]))
+  -- align = "center", width 80, 20 columns: a pad of 30
+  k = placed({ "$$", "x", "$$" }, 1, { align = "center", cols = 20, width = 80 })
+  overlay_ok(k.overlay[1], 1, { { string.rep(" ", 30), "Normal" }, { "r1", "TestPH" } }, "center")
+  -- centred, but never left of the indent
+  k = placed({ string.rep(" ", 40) .. "$$x$$" }, 1, { align = "center", cols = 20, width = 80 })
+  overlay_ok(k.overlay[1], 0, { { string.rep(" ", 40), "Normal" }, { "r1", "TestPH" } }, "center, deep indent")
+  -- overlay = false: every source line concealed, all rows above the first
+  k = placed({ "$$", "x", "$$" }, 1, { overlay = false })
+  assert(#k.overlay == 0 and #k.below == 0 and #k.above == 1, "6d. no overlay S3 R1: " .. vim.inspect(k))
+  assert(k.above[1].row == 0 and rows_of(k.above[1].o.virt_lines) == "r1",
+    "6d. no overlay S3 R1: virtual lines wrong: " .. vim.inspect(k.above[1]))
+  k = placed({ "$$\\frac{a}{b}$$" }, 3, { overlay = false })
+  assert(#k.overlay == 0 and #k.below == 0 and #k.above == 1, "6d. no overlay S1 R3: " .. vim.inspect(k))
+  assert(k.above[1].row == 0 and rows_of(k.above[1].o.virt_lines) == "r1,r2,r3",
+    "6d. no overlay S1 R3: virtual lines wrong: " .. vim.inspect(k.above[1]))
+  -- overlay = true is the default
+  k = placed({ "$$", "x", "$$" }, 1, { overlay = true })
+  assert(#k.overlay == 1 and #k.above == 0, "6d. overlay = true: " .. vim.inspect(k))
+end
+print("6d. placement: S3 R1, S3 R3, S1 R3, S5 R2, wide line, indent, center, overlay = false ok")
+
+-- 6e. an image path that fails leaves the text rendering
+do
+  local ls = { "$$", "x", "$$", "$$y$$" }
+  for what, answer in pairs({
+    error = function() error("boom") end,
+    ["no rows"] = function() return { cols = 3, hl = "TestPH", text = { "r1" } } end,
+    ["rows 0"] = function() return { rows = 0, cols = 3, hl = "TestPH", text = {} } end,
+    ["a row missing"] = function() return { rows = 2, cols = 3, hl = "TestPH", text = { "r1" } } end,
+    ["no hl"] = function() return { rows = 1, cols = 3, text = { "r1" } } end,
+    ["not a table"] = function() return "image" end,
+    ["fractional rows"] = function() return { rows = 1.5, cols = 3, hl = "TestPH", text = { "r1", "r2" } } end,
+  }) do
+    local ctx, calls = fake_ctx(answer)
+    local b, ms = render_ctx(ls, ctx)
+    assert(#calls == 2, "6e. " .. what .. ": asked " .. #calls .. " times")
+    assert(same_marks(mark_list(ms), text_marks(ls)), "6e. " .. what .. ": not the text rendering")
+    vim.api.nvim_buf_delete(b, { force = true })
+  end
+  -- one block an image, the next text: each block on its own
+  local ctx = fake_ctx(function(tex) return tex == "x" and image(1) or nil end)
+  local b, ms = render_ctx(ls, ctx)
+  local overlay3, inline3 = false, false
+  for _, m in ipairs(ms) do
+    if m[2] == 1 and m[4].virt_text_pos == "overlay" then overlay3 = true end
+    if m[2] == 3 and m[4].virt_text_pos == "inline" and m[4].virt_text[1][1] == "y" then inline3 = true end
+  end
+  assert(overlay3 and inline3, "6e. an image block and a text block side by side wrong")
+  vim.api.nvim_buf_delete(b, { force = true })
+end
+print("6e. a failing or malformed answer keeps the text rendering ok")
+
+-- 6f. on screen: the image rows, then the cell's own rows. The cell's
+-- spacer is a leftcol virtual line at the END of its last line (as
+-- render.lua anchors it), so the rows hung at column 0 of that line by the
+-- markdown renderer (a formula's extra rows, a table's bottom border) show
+-- before it.
+do
+  -- the cell's lines between a line "before" (virtual lines above the
+  -- buffer's first line only show once scrolled to) and a line "after"
+  local function screen(ls, ctx, rows)
+    local b = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, { "before" })
+    vim.api.nvim_buf_set_lines(b, -1, -1, false, ls)
+    local last = #ls
+    vim.api.nvim_buf_set_extmark(b, ns, last, #ls[#ls], {
+      virt_lines = { { { "SPACER", "Normal" } } }, virt_lines_leftcol = true,
+    })
+    MD.render(b, ns, 1, last, 60, ctx)
+    vim.api.nvim_buf_set_lines(b, -1, -1, false, { "after" })
+    local win = vim.api.nvim_open_win(b, true, { relative = "editor", row = 0, col = 0, width = 60, height = 12 })
+    vim.wo[win].conceallevel = 2
+    vim.wo[win].concealcursor = "nc"
+    vim.wo[win].wrap = true
+    vim.api.nvim_win_set_cursor(win, { last + 2, 0 })
+    vim.cmd("redraw")
+    local pos = vim.fn.win_screenpos(win)
+    local out = {}
+    for r = 0, rows - 1 do
+      local cells = {}
+      for c = 1, 20 do cells[#cells + 1] = vim.fn.screenstring(pos[1] + r, pos[2] + c - 1) end
+      out[#out + 1] = vim.trim(table.concat(cells))
+    end
+    vim.api.nvim_win_close(win, true)
+    vim.api.nvim_buf_delete(b, { force = true })
+    return out
+  end
+  local s = screen({ "$$\\frac{a}{b}$$" }, fake_ctx(function() return image(3) end), 6)
+  assert(table.concat(s, "|") == "before|r1|r2|r3|SPACER|after", "6f. S1 R3 on screen: " .. table.concat(s, "|"))
+  s = screen({ "$$", "x", "$$" }, fake_ctx(function() return image(1) end), 6)
+  assert(table.concat(s, "|") == "before||r1||SPACER|after", "6f. S3 R1 on screen: " .. table.concat(s, "|"))
+  s = screen({ "$$\\frac{a}{b}$$" }, fake_ctx(function() return image(3) end, { overlay = false }), 7)
+  assert(table.concat(s, "|") == "before|r1|r2|r3||SPACER|after",
+    "6f. no overlay S1 R3 on screen: " .. table.concat(s, "|"))
+  s = screen({ "| a | b |", "|---|---|", "| 1 | 2 |" }, nil, 8)
+  assert(s[6]:find("└", 1, true) and s[7] == "SPACER" and s[8] == "after",
+    "6f. a table's bottom border must come before the cell's spacer: " .. table.concat(s, "|"))
+end
+print("6f. on screen: image rows and a table's border before the cell's spacer ok")
+
+-- 6g. find_math_spans still runs once per line with a ctx
+do
+  local real = MD.find_math_spans
+  local n = 0
+  MD.find_math_spans = function(l) n = n + 1; return real(l) end
+  local ls = { "$$x$$", "\\[y\\]", "plain $z$ text", "\\begin{equation}w\\end{equation}" }
+  for _, answer in ipairs({ never, function() return image(1) end }) do
+    n = 0
+    local b = render_ctx(ls, (fake_ctx(answer)))
+    vim.api.nvim_buf_delete(b, { force = true })
+    assert(n == #ls, "6g. find_math_spans ran " .. n .. " times for " .. #ls .. " lines")
+  end
+  MD.find_math_spans = real
+end
+print("6g. find_math_spans once per line ok")
+
+-- 6h. speed: the section-5 inputs, and long blocks, with a ctx
+do
+  local inputs = {
+    string.rep("$a$*b*", 20000),
+    string.rep("[a](b)$c$", 20000),
+    string.rep("\\(", 20000),
+    string.rep("\\\\(", 20000),
+    string.rep("$$a", 20000),
+  }
+  local block = { "$$" }
+  for i = 2, 5001 do block[i] = "x_" .. i end
+  block[#block + 1] = "$$"
+  local singles = {}
+  for i = 1, 5000 do singles[i] = "$$x_" .. i .. "$$" end
+  for _, answer in ipairs({ never, function() return image(2) end }) do
+    for _, ln in ipairs(inputs) do
+      local b = vim.api.nvim_create_buf(true, false)
+      vim.api.nvim_buf_set_lines(b, 0, -1, false, { ln })
+      local t0 = vim.uv.hrtime()
+      MD.render(b, ns, 0, 0, 80, fake_ctx(answer))
+      local dt = (vim.uv.hrtime() - t0) / 1e6
+      assert(dt < 1000, ("6h. %s... took %.0f ms with a ctx"):format(ln:sub(1, 12), dt))
+      vim.api.nvim_buf_delete(b, { force = true })
+    end
+    for what, ls in pairs({ ["a 5002-line block"] = block, ["5000 one-line blocks"] = singles }) do
+      local b = vim.api.nvim_create_buf(true, false)
+      vim.api.nvim_buf_set_lines(b, 0, -1, false, ls)
+      local t0 = vim.uv.hrtime()
+      MD.render(b, ns, 0, #ls - 1, 80, fake_ctx(answer))
+      local dt = (vim.uv.hrtime() - t0) / 1e6
+      assert(dt < 1000, ("6h. %s took %.0f ms with a ctx"):format(what, dt))
+      vim.api.nvim_buf_delete(b, { force = true })
+    end
+  end
+end
+print("6h. speed with a ctx ok")
+
 print("ALL MARKDOWN CHECKS PASSED")
 vim.cmd("qa!")
