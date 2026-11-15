@@ -114,9 +114,75 @@ fn library_calls() -> Vec<String> {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+
+        // Math: success, each failure the dependencies could print on, and
+        // mhchem, on the calling thread and then on a worker.
+        let wide = "x+".repeat(200);
+        let math = [
+            (r"x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}", OK),
+            (r"\undefinedcommand", ERR),
+            (r"\text{日本語}", ERR),
+            (wide.as_str(), ERR),
+            (r"\ce{H2O}", OK),
+            (r"\ce{\frac{", ERR),
+            (r"\phase{x} \angl{n} \sout{abc} \cancel{\frac{1}{2}}", OK),
+        ];
+        for (tex, want) in math {
+            let req = math_request(tex);
+            let mut out: *mut JnvBuf = null_mut();
+            let st = jnv_call(ctx, KIND_MATH, req.as_ptr() as *const c_char, req.len(), &mut out);
+            if st != want || out.is_null() {
+                problems.push(format!("jnv_call MATH {tex:?} gave status {st}"));
+            }
+            jnv_buf_free(out);
+            let mut job = 0u64;
+            let st = jnv_submit(ctx, KIND_MATH, PRIO_NORMAL | FLAG_COPY, req.as_ptr() as *const c_char, req.len(), &mut job);
+            if st != OK {
+                problems.push(format!("jnv_submit MATH {tex:?} gave status {st}"));
+                continue;
+            }
+            match wait_one(ctx, job) {
+                Ok(s) if s == want => {}
+                Ok(s) => problems.push(format!("the MATH job {tex:?} came back with status {s}")),
+                Err(e) => problems.push(e),
+            }
+        }
+        let mut out: *mut JnvBuf = null_mut();
+        let st = jnv_call(ctx, KIND_MATH_CELL, b"".as_ptr() as *const c_char, 0, &mut out);
+        if (st != OK && st != ERR) || out.is_null() {
+            problems.push(format!("jnv_call MATH_CELL gave status {st}"));
+        }
+        jnv_buf_free(out);
         jnv_close(ctx);
     }
     problems
+}
+
+/// A math request for `tex` at 10x20 cells.
+fn math_request(tex: &str) -> Vec<u8> {
+    let mut r = format!("JNM 1\nfg #c0caf5\ncell 10 20\nscale 1\nmax 100 60\npre 0\ntex {}\n\n", tex.len()).into_bytes();
+    r.extend_from_slice(tex.as_bytes());
+    r
+}
+
+/// Wait up to 5 s for `job` (the only one in flight); its status.
+unsafe fn wait_one(ctx: *mut JnvCtx, job: u64) -> Result<i32, String> {
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut done = [JnvDone { job: 0, kind: 0, status: -1, result: null_mut() }; 4];
+    loop {
+        let k = jnv_poll(ctx, done.as_mut_ptr(), done.len());
+        if k > 0 {
+            let got = (done[0].job, done[0].status);
+            for d in &done[..k] {
+                jnv_buf_free(d.result);
+            }
+            return if k == 1 && got.0 == job { Ok(got.1) } else { Err(format!("job {job} came back as {:?}", &done[..k])) };
+        }
+        if Instant::now() > end {
+            return Err(format!("job {job} did not come back in 5 s"));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn main() {
@@ -130,7 +196,7 @@ fn main() {
         failed += 1;
     }
     if printed.is_empty() {
-        println!("ok the library wrote nothing to stderr (sync panic, worker panic, failed open)");
+        println!("ok the library wrote nothing to stderr (sync panic, worker panic, failed open, math)");
     } else {
         println!(
             "FAIL the library wrote {} bytes to stderr:\n{}",
