@@ -42,7 +42,11 @@ local S = REG.jupynvim_native
 local has_ffi, ffi = pcall(require, "ffi")
 if not has_ffi then ffi = nil end
 
-M.ABI_MAJOR, M.ABI_MINOR = 1, 2
+-- The ABI this plugin needs to load the library at all: a later minor of the
+-- same major also loads. A minor that only adds job kinds does not raise it;
+-- a caller of such a kind asks jnv_kind_supported first (the math kinds came
+-- with 1.2; a 1.1 library loads, and math then shows as text).
+M.ABI_MAJOR, M.ABI_MINOR = 1, 1
 M.KIND = {
   NOP = 1, ECHO = 2, BYTESUM = 3, PTR = 4, SLEEP = 5, PANIC = 6, FILL = 7,
   PALETTE = 2048, PALETTE_SCHEMA = 2049, PALETTE_READABLE = 2050,

@@ -167,7 +167,9 @@ end)
 
 -- ── R4 the library's download from a pre-release ─────────────────────────
 -- The library check in a Neovim of its own is native_probe.lua; this copy's
--- probe answers for a library at `version`, so the case needs no build.
+-- probe answers for a library at `version`, so the case needs no build. It
+-- answers ABI 1.1: the least the loader takes, and what the library
+-- published with v0.5.0-beta.1 reports.
 case("R4", function()
   local t = Install._lib_target()
   if not t then
@@ -176,7 +178,7 @@ case("R4", function()
   end
   local function probe_says(dir, version)
     write_file(dir .. "/lua/jupynvim/backend/native_probe.lua",
-      ('io.write("jnv-probe ok %s 1.2\\n")\n'):format(version))
+      ('io.write("jnv-probe ok %s 1.1\\n")\n'):format(version))
   end
   local P = plugin("lib-beta", BETA)
   probe_says(P, BETA)
