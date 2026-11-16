@@ -108,7 +108,9 @@ https://github.com/user-attachments/assets/2a3fbd17-561d-4c37-b856-a912944f88f8
   built without LuaJIT, everything works as before.
 - Display math as images needs what inline images need (kitty or Ghostty,
   `image_renderer = "placeholder"`) and `libjupynvim`, which typesets the
-  formulas. Where one is missing, math shows as readable text. A source
+  formulas. Where one is missing, math shows as readable text. A library
+  from before math images (the v0.5.0-beta.1 prebuilt) still loads and runs
+  everything else; with it, math shows as text too. A source
   build of the library (`cargo build --release` in `core/`) downloads its
   crates from crates.io the first time, the math typesetter and the PNG
   encoder among them, so it needs a network once; the prebuilt library
@@ -818,8 +820,13 @@ Lua keeps the result by formula, transmits it once with the Kitty graphics
 protocol, and draws Unicode placeholders over the block's concealed source
 lines, where the terminal shows the image. Until the result is there, and
 whenever a formula cannot be typeset, the block keeps its text rendering. A
-render that finds every formula done costs a few table lookups and writes
-nothing to the terminal.
+render that finds every formula done asks nothing of the library and writes
+nothing to the terminal. It places one mark per source line of a block, as
+the text rendering does, plus one when the image has more rows than the block
+has lines, but a row of placeholder cells costs Neovim more to place than a
+line of text: on a notebook with hundreds of formulas such a render takes
+about twice as long as with `math.renderer = "text"` (21 ms against 9 ms for
+400 formulas, measured on one machine).
 
 ### Remote (SSH)
 
@@ -970,19 +977,26 @@ in order with the screen and does not have this problem.
 Math images are for display math on lines of its own. These stay readable
 text: inline math; display math inside a quote, a list item or a paragraph
 (`text $$x$$ text`); a block with text after its closing delimiter; a
-formula that uses `\ref` or `\eqref`; a formula with a character the KaTeX
-fonts do not have (CJK text, emoji); a formula wider than the window even at
-half its size (a slightly wide one is shrunk to fit); and anything else
-RaTeX cannot typeset (`multline` and `eqnarray` are rewritten to forms it
-can). Equations are not numbered, as in JupyterLab, and `\label` is dropped;
-an explicit `\tag{..}` still shows. Macros defined with `\newcommand`, `\def`
-and the like in a markdown cell apply to the formulas of that cell and of
-every cell below it, also when the definition sits in a code span, where
-Jupyter would skip it; a change to them reaches the cells below once you
-leave the cell's edit mode. A formula whose source line is wider than the
-window is drawn above that line, and the line's wrapped rows stay as blank
-rows under the image. A notebook opens with its math as text, and each
-formula turns into an image as its job finishes.
+formula that uses `\ref` or `\eqref`; chemistry with `\ce` or `\pu`
+(mhchem), for now; a formula with a character the KaTeX fonts do not have
+(CJK text, emoji); a formula wider than the window even at half its size (a
+slightly wide one is shrunk to fit); and anything else RaTeX cannot typeset
+(`multline` and `eqnarray` are rewritten to forms it can). Equations are not
+numbered, as in JupyterLab, and `\label` is dropped; an explicit `\tag{..}`
+still shows. Macros defined with `\newcommand`, `\def` and the like in a
+markdown cell apply to the formulas of that cell and of every cell below it,
+also when the definition sits in a code span, where Jupyter would skip it; a
+change to them reaches the cells below once you leave the cell's edit mode.
+A `%` anywhere in a markdown cell starts a TeX comment as far as definitions
+go, also in prose: a definition after it on the same line is not seen
+(`Growth was 50% faster. $\newcommand{\R}{\mathbb{R}}$` defines nothing), so
+put definitions on a line of their own. A formula whose source line is wider
+than the window is drawn above that line, and the line's wrapped rows stay
+as blank rows under the image. A notebook opens with its math as text, and
+each formula turns into an image as its job finishes. Every display formula
+of an open notebook is typeset, also the ones off screen, and the sizes are
+capped: an image is at most 1 MiB, and the images kept for all notebooks at
+most 64 MiB. A formula past either cap shows as text.
 
 The image's size comes from the size of a terminal cell in pixels, which
 jupynvim asks the terminal for. Inside tmux, over a remote UI, or in a
