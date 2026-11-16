@@ -18,12 +18,16 @@
 -- is loaded. Every failure leaves a block with its text rendering.
 --
 -- Whatever a notebook holds, what it can cost is bounded: at most
--- MAX_INFLIGHT jobs at once, each cancelled after JOB_MS; per render at most
--- MAX_TX_PER_RENDER transmits and render_bytes of base64 (one transmit always
--- goes, so a notebook settles); an image of at most image_b64 bytes, and
--- cache_bytes of base64 cached across every notebook; the macro prelude
--- from at most MAX_DEF_CELLS cells. A render that put nothing new on the
--- terminal asks for no other, and nothing is retried on a timer.
+-- MAX_INFLIGHT jobs at once (one in flight past JOB_MS is cancelled and
+-- gives its slot back, though its answer is still taken if it comes); per
+-- render at most render_bytes of base64 sent (one transmit always goes, so
+-- a notebook settles); an image of at most image_b64 bytes, and cache_bytes
+-- of base64 cached across every notebook; the macro prelude from at most
+-- MAX_DEF_CELLS cells. The renders this module asks for itself (a job done,
+-- transmits held back, a job slot free again) come at most once per
+-- buffer per GAP_X times that buffer's last render, so a large notebook
+-- leaves the main loop free between them. A render that put nothing new on
+-- the terminal asks for no other, and nothing is retried on a timer.
 --
 -- render.lua calls, per render: begin (once), then cell and cell_done around
 -- markdown.render of each markdown cell that is not being edited, then
@@ -39,12 +43,14 @@ local MAX_PRELUDE = 65536      -- bytes of macro-defining source sent with a for
 local MAX_DEF_CELLS = 64       -- macro-defining cells read for the prelude, from the top
 local MAX_ROWS = 60            -- the tallest image, in terminal rows
 local MAX_COLS = 297           -- the widest image, in terminal columns (placeholder limit)
-local MAX_INFLIGHT = 64        -- jobs at once; the blocks beyond wait for a slot to free up
-local MAX_TX_PER_RENDER = 16   -- transmits in one render; the rest go in the next ones
+local MAX_INFLIGHT = 256       -- jobs at once; the blocks beyond wait for a slot to free up
 local CACHE_MAX = 1024         -- formula records kept before the oldest are dropped
 local FIT_MAX = 4              -- widths a formula that had to shrink keeps results for
 local JOB_MS = 10000           -- a job in flight longer than this is cancelled
 local WATCH_MS = 1000          -- begin looks for such jobs at most this often
+-- the renders the module asks for itself: one per buffer per GAP_X times
+-- the buffer's last render, never closer than GAP_MIN nor further than GAP_MAX
+local GAP_MIN, GAP_MAX, GAP_X = 30, 1000, 3
 
 -- The byte bounds (the spec lowers them to test them).
 M._limits = {
@@ -53,13 +59,18 @@ M._limits = {
   render_bytes = 2 * 1048576,              -- base64 transmitted by one render
 }
 
+-- timeouts: jobs that went past JOB_MS; late: of those, the ones whose
+-- result came all the same; prelude_cut: blocks shown as text because a
+-- macro-defining cell at or above theirs was left out of the prelude
 M.stats = { blocks = 0, hits = 0, submits = 0, done = 0, fails = 0, cancels = 0,
-            transmits = 0, deferred = 0, timeouts = 0, budget = 0, evict_scans = 0 }
+            transmits = 0, deferred = 0, timeouts = 0, late = 0, budget = 0, evict_scans = 0,
+            prelude_cut = 0 }
 
 -- Seams for the tests.
 M._native = nil                -- a stand-in for require("jupynvim.native")
 M._nominal = { w = 18, h = 40 }
 M._now = function() return vim.uv.hrtime() / 1e6 end   -- milliseconds
+M._defer = function(fn, ms) vim.defer_fn(fn, ms) end    -- a render asked for later
 -- Placeholder rows drawn as overlays on the block's concealed lines (true),
 -- or all of them as virtual lines above it (false). Not a config key.
 M._overlay = true
@@ -70,17 +81,27 @@ local ALIGNS = { left = true, center = true }
 -- cache[prelude][tex] = F, for the current variant only. F is one formula
 -- with one prelude:
 --   { used = tick, users = { [buf] = tick }, err = msg|nil, nat = R|nil,
---     fit = { [avail] = R | { pending = id } | { err = msg, budget = bool } },
+--     fit = { [avail] = R | { pending = id, users = { [buf] = tick } }
+--                         | { err = msg, budget = bool } },
 --     fit_order = { avail, ... }, waiters = { [buf] = true },
 --     bytes = <base64 bytes of its results>, pre = prelude, tex = tex }
--- users[buf] is the tick of the last render of that buffer that used it; F
--- is in use while it is that buffer's latest render (B.tick).
+-- users[buf] is the tick of the last render of that buffer that showed F or
+-- asked for it; F is in use while that is the buffer's latest render
+-- (B.tick).
 -- R is one typeset result:
---   { id = "jm<serial>", b64 = string, rows = n, cols = n, shrunk = bool }
+--   { id = "jm<serial>", b64 = string, rows = n, cols = n, shrunk = bool,
+--     used = tick, users = { [buf] = tick } }
+-- Its users are the renders that showed it (or, until one has, the ones
+-- that asked for it at its width): R is in use while one of them is its
+-- buffer's latest render. The byte budget counts results, so a width no
+-- window shows any more gives its bytes back even while F is in use.
 -- B is one notebook buffer:
 --   { buf, nb, tick, has = { [cell_key] = { src, has } }, def_src = {},
---     def_idx = {}, prefix = {}, cells = { [cell_key] = <slot count> },
---     span = { [slot_key] = { first, last } } }
+--     def_idx = {}, prefix = {}, cut = <index of the first defining cell
+--     left out of the prelude> | nil, cells = { [cell_key] = <slot count> },
+--     span = { [slot_key] = { first, last } },
+--     t_begin = <ms at its latest begin>, dur = <ms that render took>,
+--     ask = <token of a render this module asked for and is waiting on> }
 local S = {
   cfg = { renderer = "auto", scale = 1.0, align = "left", cell_px = nil },
   lib = "unasked",                 -- "unasked" | "wait" | "ok" | "off"
@@ -91,8 +112,11 @@ local S = {
   n = 0,                           -- number of F records
   bytes = 0,                       -- base64 bytes of every R in the cache
   dry = nil,                       -- { n, bytes, tick } of an eviction scan that left it over
-  jobs = {},                       -- job id -> { F, avail, cw, ch, tex, t0 }
-  inflight = 0,
+  -- job id -> { F, avail, mark = F.fit[avail], cw, ch, tex, t0, overdue }.
+  -- An overdue job was cancelled after JOB_MS and gave its slot back; it
+  -- stays here, and its mark stays pending, until its answer comes.
+  jobs = {},
+  inflight = 0,                    -- jobs that hold a slot: those not overdue
   starved = {},                    -- buf -> true: wanted a job while every slot was taken
   watch_at = nil,                  -- when begin last looked for overdue jobs
   tick = 0, serial = 0,
@@ -115,31 +139,48 @@ local function refresh(nb)
   end
 end
 
--- the same a little later, at most one waiting per buffer: the transmits a
--- render held back (see finish). A buffer forgotten meanwhile is not.
-local later = {}
-local function later_refresh(nb)
-  local buf = nb and nb.buf
-  if not buf or later[buf] then return end
+-- How long after the start of B's latest render a render this module asks
+-- for may start: GAP_X times what that render took, within GAP_MIN..GAP_MAX.
+-- A notebook whose render costs a lot is then rendered seldom while its
+-- jobs come in, and the main loop stays free most of the time.
+local function gap(B)
+  local g = GAP_X * (tonumber(B.dur) or 0)
+  if not (g >= GAP_MIN) then g = GAP_MIN end
+  if g > GAP_MAX then g = GAP_MAX end
+  return g
+end
+
+-- A render of B that this module wants (a job done, transmits held back, a
+-- job slot free again): at most one per gap(B), counted from the start of
+-- B's latest render, whoever caused that one. Every request made while one
+-- waits rides on it. It waits until the next begin of B, which answers it
+-- (so a render the user causes in between makes it unneeded, and is never
+-- held back itself); a buffer forgotten meanwhile is not rendered.
+local function ask(B)
+  if not B or B.ask then return end
   local token = {}
-  later[buf] = token
-  vim.defer_fn(function()
-    if later[buf] ~= token then return end
-    later[buf] = nil
-    refresh(nb)
-  end, 20)
+  B.ask = token
+  local function go()
+    if B.ask == token and S.bufs[B.buf] == B then refresh(B.nb) end
+  end
+  local wait = B.t_begin and (B.t_begin + gap(B) - M._now()) or 0
+  if wait >= 1 then
+    M._defer(go, math.min(GAP_MAX, math.ceil(wait)))
+  else
+    go()
+  end
 end
 
 -- the notebooks of a set of buffers ({ [buf] = true }), but `except`
 local function refresh_set(set, except)
   for buf in pairs(set) do
     local B = S.bufs[buf]
-    if buf ~= except and B and B.nb and vim.api.nvim_buf_is_valid(buf) then refresh(B.nb) end
+    if buf ~= except and B and B.nb and vim.api.nvim_buf_is_valid(buf) then ask(B) end
   end
 end
 
 -- A job slot came free: the notebooks that wanted one render again (each
--- once: Render.refresh coalesces). This, not a timer, ends a wait for a slot.
+-- once: ask coalesces). This, not a timer, ends a wait for a slot.
 local function slots_freed(except)
   if next(S.starved) == nil then return end
   local set = S.starved
@@ -388,9 +429,12 @@ local function fg_hex()
   return vim.o.background == "light" and "#24292e" or "#d0d0d0"
 end
 
+-- every job dropped (an overdue one was cancelled already)
 local function cancel_jobs()
   local N = native()
-  for id in pairs(S.jobs) do pcall(N.cancel, id) end
+  for id, j in pairs(S.jobs) do
+    if not j.overdue then pcall(N.cancel, id) end
+  end
   S.jobs = {}
   S.inflight = 0
 end
@@ -404,11 +448,19 @@ end
 
 -- A new colour, cell size or scale: every result is for the old one. The
 -- results of the dropped jobs find no entry in S.jobs and are ignored; each
--- slot keeps its old image until the new one replaces it.
-local function switch_variant(vkey)
+-- slot keeps its old image until the new one replaces it. The notebooks
+-- that waited for one of those jobs, or for a job slot, render again (but
+-- `except`, the one whose render switched): no completion will wake them.
+local function switch_variant(vkey, except)
+  local wake = S.starved
+  S.starved = {}
+  for _, j in pairs(S.jobs) do
+    for buf in pairs(j.F.waiters) do wake[buf] = true end
+  end
   cancel_jobs()
   empty_cache()
   S.vkey = vkey
+  refresh_set(wake, except)
 end
 
 -- Needles for "this cell may define macros", plain finds.
@@ -435,12 +487,15 @@ end
 -- The keys of the markdown cells (seen: the set; keys and at: by index),
 -- and the sources of the cells that may define macros, in order: the first
 -- MAX_DEF_CELLS of them while they come to at most MAX_PRELUDE bytes
--- together; the ones after are left out (those above keep working). The
--- cell being edited keeps the source it had when editing started: a
--- keystroke in a macro cell must not typeset every formula below it again.
+-- together. The ones after are left out, and B.cut is the index of the
+-- first of them: from that cell down a formula could be drawn with a macro
+-- missing or with an older meaning, so those cells show their math as
+-- text (prelude_for). The cell being edited keeps the source it had when
+-- editing started: a keystroke in a macro cell must not typeset every
+-- formula below it again.
 local function scan_cells(B, nb, edit_idx)
   local seen, keys, at, list, idxs = {}, {}, {}, {}, {}
-  local size, open = 0, true
+  local size, open, cut = 0, true, nil
   for i, cell in ipairs(nb.cells or {}) do
     if type(cell) == "table" and cell.cell_type == "markdown" then
       local id = cell.id
@@ -462,11 +517,12 @@ local function scan_cells(B, nb, edit_idx)
           idxs[#idxs + 1] = i
           size = size + add
         else
-          open = false
+          open, cut = false, i
         end
       end
     end
   end
+  B.cut = cut
   local same = #list == #B.def_src
   if same then
     for k = 1, #list do
@@ -483,8 +539,10 @@ end
 
 -- The raw source of every collected macro-defining cell from the top down
 -- to and including cell idx, joined with "\n" (the library takes only the
--- definitions out of it). "" when there is none.
+-- definitions out of it). "" when there is none; nil when a defining cell
+-- at or above idx was left out (never draw with part of the macros).
 local function prelude_for(B, idx)
+  if B.cut and idx >= B.cut then return nil end
   -- the number of collected cells at or above idx (def_idx is ascending)
   local lo, hi = 0, #B.def_idx
   while lo < hi do
@@ -494,12 +552,12 @@ local function prelude_for(B, idx)
   local k = lo
   if k == 0 then return "" end
   local p = B.prefix[k]
-  if not p then
+  if p == nil then
     p = table.concat(B.def_src, "\n", 1, k)
-    if #p > MAX_PRELUDE then p = "" end
+    if #p > MAX_PRELUDE then p = false end
     B.prefix[k] = p
   end
-  return p
+  return p or nil
 end
 
 -- ── the cache ───────────────────────────────────────────────────────────
@@ -521,13 +579,36 @@ local function has_pending(F)
   return false
 end
 
--- some notebook's latest render showed it or asked for it
-local function in_use(F)
-  for buf, t in pairs(F.users) do
+local function drop_fit(F, avail)
+  F.fit[avail] = nil
+  for i = #F.fit_order, 1, -1 do
+    if F.fit_order[i] == avail then table.remove(F.fit_order, i) end
+  end
+end
+
+-- users = { [buf] = tick }: some notebook's latest render is among them
+local function used_now(users)
+  for buf, t in pairs(users) do
     local B = S.bufs[buf]
     if B and B.tick == t then return true end
   end
   return false
+end
+
+-- the record: some notebook's latest render showed it or asked for it
+local function in_use(F) return used_now(F.users) end
+
+local function has_result(F)
+  if F.nat then return true end
+  for _, f in pairs(F.fit) do
+    if f.b64 then return true end
+  end
+  return false
+end
+
+local function is_cached(F)
+  local P = S.cache[F.pre]
+  return P ~= nil and P[F.tex] == F
 end
 
 local function drop_record(F)
@@ -540,11 +621,15 @@ local function drop_record(F)
   end
 end
 
--- Drops the least recently used records that no notebook's latest render
--- uses and that wait for no job, down to three quarters of CACHE_MAX and,
--- with `need` bytes more, of the byte budget. A scan that leaves the cache
--- over a bound is remembered, and the next one waits until the cache
--- changes size (strict: or another render may have stopped using a record).
+-- Over the byte budget (with `need` bytes more): drops the least recently
+-- used results that no notebook's latest render uses, down to three
+-- quarters of it, though their record may be in use at another width; a
+-- record left with no result, no job and no user goes too. Over CACHE_MAX
+-- records: drops the least recently used records that no notebook's latest
+-- render uses and that wait for no job, down to three quarters of it. A
+-- scan that leaves the cache over a bound is remembered, and the next one
+-- waits until the cache changes size (strict: or a render has happened,
+-- after which other results may be out of use).
 local function evict(need, strict)
   need = need or 0
   local L = M._limits
@@ -552,18 +637,41 @@ local function evict(need, strict)
   local d = S.dry
   if d and d.n == S.n and d.bytes == S.bytes and (not strict or d.tick == S.tick) then return end
   M.stats.evict_scans = M.stats.evict_scans + 1
-  local list = {}
-  for _, P in pairs(S.cache) do
-    for _, F in pairs(P) do
-      if not in_use(F) and not has_pending(F) then list[#list + 1] = F end
+  if S.bytes + need > L.cache_bytes then
+    local b_to = math.floor(L.cache_bytes * 3 / 4) - need
+    local list = {}
+    for _, P in pairs(S.cache) do
+      for _, F in pairs(P) do
+        if F.nat and not used_now(F.nat.users) then list[#list + 1] = { F, false, F.nat } end
+        for a, f in pairs(F.fit) do
+          if f.b64 and not used_now(f.users) then list[#list + 1] = { F, a, f } end
+        end
+      end
+    end
+    table.sort(list, function(x, y) return (x[3].used or 0) < (y[3].used or 0) end)
+    for _, e in ipairs(list) do
+      if S.bytes <= b_to then break end
+      local F = e[1]
+      if is_cached(F) then
+        if e[2] then drop_fit(F, e[2]) else F.nat = nil end
+        account(F)
+        if not has_result(F) and not has_pending(F) and not in_use(F) then drop_record(F) end
+      end
     end
   end
-  table.sort(list, function(a, b) return (a.used or 0) < (b.used or 0) end)
-  local n_to = math.floor(CACHE_MAX * 3 / 4)
-  local b_to = math.floor(L.cache_bytes * 3 / 4) - need
-  for _, F in ipairs(list) do
-    if S.n <= n_to and S.bytes <= b_to then break end
-    drop_record(F)
+  if S.n > CACHE_MAX then
+    local list = {}
+    for _, P in pairs(S.cache) do
+      for _, F in pairs(P) do
+        if not in_use(F) and not has_pending(F) then list[#list + 1] = F end
+      end
+    end
+    table.sort(list, function(a, b) return (a.used or 0) < (b.used or 0) end)
+    local n_to = math.floor(CACHE_MAX * 3 / 4)
+    for _, F in ipairs(list) do
+      if S.n <= n_to then break end
+      drop_record(F)
+    end
   end
   if S.n > CACHE_MAX or S.bytes + need > L.cache_bytes then
     S.dry = { n = S.n, bytes = S.bytes, tick = S.tick }
@@ -573,13 +681,6 @@ local function evict(need, strict)
 end
 
 -- ── jobs ────────────────────────────────────────────────────────────────
-
-local function drop_fit(F, avail)
-  F.fit[avail] = nil
-  for i = #F.fit_order, 1, -1 do
-    if F.fit_order[i] == avail then table.remove(F.fit_order, i) end
-  end
-end
 
 -- at most FIT_MAX widths, the oldest dropped first, never a pending one
 local function trim_fit(F)
@@ -596,7 +697,7 @@ local function trim_fit(F)
   end
 end
 
--- Keeps R for F at width avail, inside the byte budget: records nobody's
+-- Keeps R for F at width avail, inside the byte budget: results nobody's
 -- latest render uses go first, oldest first. When that does not make room,
 -- R is refused as a size failure at this width (another width, or room made
 -- by a notebook that goes away, can still take one). False when refused.
@@ -682,22 +783,31 @@ local function parse_response(out, j)
   if n <= 0 or #b64 ~= n then return nil, "the image is not as long as the head says", "internal" end
   if not Image._b64_ok(b64) then return nil, "the image is not base64", "internal" end
   S.serial = S.serial + 1
-  return { id = "jm" .. S.serial, b64 = b64, rows = rows, cols = cols, shrunk = f.shrunk == "1" }
+  return { id = "jm" .. S.serial, b64 = b64, rows = rows, cols = cols, shrunk = f.shrunk == "1",
+           used = S.tick, users = {} }
 end
 
+-- A job's answer. An overdue job (see watchdog) is answered like any other:
+-- a result that comes late is kept and shown, CANCELLED means it never ran
+-- (a later render asks again), an error is an error. Its slot was given
+-- back when it went overdue, so it frees none now.
 local function done(id, ok, out, status)
   local j = S.jobs[id]
-  if not j then return end      -- dropped: another variant, reset, wipe or timeout
+  if not j then return end      -- dropped: another variant, reset or wipe
   S.jobs[id] = nil
-  S.inflight = math.max(0, S.inflight - 1)
+  local freed = not j.overdue
+  if freed then S.inflight = S.inflight - 1 end
   local F = j.F
   local N = native()
   local cancelled = N.STATUS and N.STATUS.CANCELLED
   if ok then
     local R, why, class = parse_response(out, j)
     if R then
+      -- in use for the renders that asked for it at this width, until one shows it
+      R.users = j.mark.users or {}
       if store(F, j.avail, R) then
         M.stats.done = M.stats.done + 1
+        if j.overdue then M.stats.late = M.stats.late + 1 end
       else
         M.stats.budget = M.stats.budget + 1
         M.stats.fails = M.stats.fails + 1
@@ -732,11 +842,11 @@ local function done(id, ok, out, status)
   local waiters = F.waiters
   F.waiters = {}
   refresh_set(waiters)
-  slots_freed()
+  if freed then slots_freed() end
 end
 
 -- With every job slot taken the block waits: its buffer is noted, and the
--- next completion (or timeout) renders it again.
+-- next completion (or a job going overdue) renders it again.
 local function submit(F, tex, prelude, avail, rctx, spec)
   if S.inflight >= MAX_INFLIGHT then
     S.starved[rctx.buf] = true
@@ -758,54 +868,55 @@ local function submit(F, tex, prelude, avail, rctx, spec)
     F.err = "submit: " .. tostring(why)
     return
   end
-  F.fit[avail] = { pending = id }
+  local mark = { pending = id, users = { [rctx.buf] = S.tick } }
+  F.fit[avail] = mark
   F.fit_order[#F.fit_order + 1] = avail
   trim_fit(F)
   account(F)
-  S.jobs[id] = { F = F, avail = avail, cw = cw, ch = ch, tex = Image.log_text(tex), t0 = M._now() }
+  S.jobs[id] = { F = F, avail = avail, mark = mark, cw = cw, ch = ch, tex = Image.log_text(tex),
+                 t0 = M._now(), overdue = false }
   S.inflight = S.inflight + 1
   M.stats.submits = M.stats.submits + 1
 end
 
--- A job in flight for longer than JOB_MS is cancelled, and its formula
--- fails for this variant: a slow formula, or a library that never answers,
--- cannot hold a job slot for good. Looked for from begin, at most once per
--- WATCH_MS. The notebooks that waited for it, or for a slot, render again
--- (but `except`, the one being rendered).
+-- A job in flight for longer than JOB_MS goes overdue: it is cancelled
+-- and gives its job slot back, so a slow formula, a long queue or a library
+-- that never answers cannot hold a slot for good. It judges nothing: the
+-- job stays in S.jobs and its formula stays pending (text, not asked for
+-- again) until its answer decides (see done); a wait of the main loop or of
+-- the library's queue costs no formula its image. Looked for from begin, at
+-- most once per WATCH_MS. The notebooks that waited for a slot render
+-- again (but `except`, the one being rendered).
 local function watchdog(except)
-  if next(S.jobs) == nil then return end
+  if S.inflight <= 0 then return end
   local now = M._now()
   if S.watch_at and now - S.watch_at < WATCH_MS then return end
   S.watch_at = now
-  local N, waiters, any = nil, {}, false
+  local N, any = nil, false
   for id, j in pairs(S.jobs) do
-    if now - j.t0 > JOB_MS then
+    if not j.overdue and now - j.t0 > JOB_MS then
       N = N or native()
       pcall(N.cancel, id)
-      S.jobs[id] = nil
-      S.inflight = math.max(0, S.inflight - 1)
-      local F = j.F
-      F.err = "math: internal: timed out"
-      drop_fit(F, j.avail)
-      account(F)
-      for buf in pairs(F.waiters) do waiters[buf] = true end
-      F.waiters = {}
+      j.overdue = true
+      S.inflight = S.inflight - 1
       M.stats.timeouts = M.stats.timeouts + 1
-      M.stats.fails = M.stats.fails + 1
-      log.debug(("math image: %s after %d ms (%s)"):format(F.err, math.floor(now - j.t0), j.tex))
+      log.debug(("math image: a job in flight for %d ms is cancelled (%s)"):format(math.floor(now - j.t0), j.tex))
       any = true
     end
   end
-  if any then
-    refresh_set(waiters, except)
-    slots_freed(except)
-  end
+  if any then slots_freed(except) end
 end
 
 -- ── one block ───────────────────────────────────────────────────────────
 
+-- a finite number of at least 1 (false for NaN and the infinities)
+local function finite_1(v)
+  return type(v) == "number" and v >= 1 and v < math.huge
+end
+
 -- ctx.math_block of one cell: an image for the block, or nil for its text
--- rendering (pending, failed, too wide, or held back to a later render).
+-- rendering (pending, failed, too wide, held back to a later render, or in
+-- a cell whose macros were cut short).
 local function math_block(cctx, tex, spec)
   cctx.n = cctx.n + 1                                  -- the block's ordinal: its slot
   local rctx = cctx.rctx
@@ -818,10 +929,19 @@ local function math_block(cctx, tex, spec)
   if type(tex) ~= "string" or type(spec) ~= "table" then free_slot(B, key); return nil end
   local first = tonumber(spec.first) or 0
   local last = tonumber(spec.last) or first
-  local avail = math.min(MAX_COLS, math.floor((tonumber(spec.width) or 80) - (tonumber(spec.indent) or 0)))
-  if #tex > MAX_TEX or avail < 1 then free_slot(B, key); return nil end
-
+  local width = tonumber(spec.width) or 80
+  local cols = width - (tonumber(spec.indent) or 0)
+  if #tex > MAX_TEX or not finite_1(width) or not finite_1(cols) then free_slot(B, key); return nil end
+  local avail = math.min(MAX_COLS, math.floor(cols))
   local prelude = cctx.prelude
+  if prelude == nil then
+    -- a macro-defining cell at or above this one was left out of the
+    -- prelude: an image could show a missing macro or an older meaning
+    M.stats.prelude_cut = M.stats.prelude_cut + 1
+    free_slot(B, key)
+    return nil
+  end
+
   local P = S.cache[prelude]
   if not P then P = {}; S.cache[prelude] = P end
   local F = P[tex]
@@ -849,6 +969,7 @@ local function math_block(cctx, tex, spec)
       return nil                                       -- pending: the old image stays in its slot
     elseif f.pending then
       F.waiters[rctx.buf] = true
+      f.users[rctx.buf] = S.tick                       -- its result is wanted at this width
       return nil
     elseif f.err then
       free_slot(B, key)                                -- too wide or too large for this width
@@ -858,6 +979,8 @@ local function math_block(cctx, tex, spec)
   end
 
   M.stats.hits = M.stats.hits + 1
+  R.used = S.tick
+  R.users[rctx.buf] = S.tick
   local bottom = last + math.max(0, R.rows - (last - first + 1))
   local sp = B.span[key]
   if sp then sp[1], sp[2] = first, bottom else B.span[key] = { first, bottom } end
@@ -867,10 +990,10 @@ local function math_block(cctx, tex, spec)
   end
   local sent = false
   if not Image.is_cached(key, R.b64, "placeholder", R.id) then
-    -- a notebook's first transmits, over renders: at most a count and a
-    -- number of bytes in one, but always one, so it gets there
+    -- a notebook's first transmits, over renders: at most render_bytes in
+    -- one, but always one, so it gets there
     local size = #R.b64
-    if rctx.tx >= MAX_TX_PER_RENDER or (rctx.tx > 0 and rctx.txb + size > M._limits.render_bytes) then
+    if rctx.tx > 0 and rctx.txb + size > M._limits.render_bytes then
       M.stats.deferred = M.stats.deferred + 1
       rctx.deferred = true
       return nil
@@ -878,9 +1001,9 @@ local function math_block(cctx, tex, spec)
     rctx.tx = rctx.tx + 1
     rctx.txb = rctx.txb + size
     M.stats.transmits = M.stats.transmits + 1
-    local sync, nb = true, rctx.nb
+    local sync = true
     Image.ensure_transmitted(key, R.b64, function(id)
-      if id and not sync then refresh(nb) end          -- it landed after this render: draw it
+      if id and not sync then ask(B) end               -- it landed after this render: draw it
     end, { renderer = "placeholder", rows = R.rows, cols = R.cols, content_id = R.id })
     sync = false
     sent = true
@@ -889,6 +1012,94 @@ local function math_block(cctx, tex, spec)
   if not ph then return nil end                        -- not there yet (the callback refreshes)
   if sent then rctx.landed[#rctx.landed + 1] = { key, R.id } end
   return { rows = R.rows, cols = R.cols, hl = ph.hl, text = ph.rows }
+end
+
+-- ── forgetting a buffer ─────────────────────────────────────────────────
+
+-- Frees the buffer's slots and forgets it. The jobs that no other notebook
+-- waits for are cancelled, and the records no other notebook used are
+-- dropped; with no notebook left, the whole cache goes. What the byte
+-- budget refused is asked for once more when the buffer used anything:
+-- there may be room now. The notebooks that waited for a job slot it held
+-- render again (but `except`).
+local function forget(buf, except)
+  local B = S.bufs[buf]
+  if B then
+    free_buffer_slots(B)
+    B.ask = nil
+  end
+  S.bufs[buf] = nil
+  S.starved[buf] = nil
+  if next(S.bufs) == nil then
+    cancel_jobs()
+    empty_cache()
+    return
+  end
+  local N = native()
+  local freed = false
+  for id, j in pairs(S.jobs) do
+    local F = j.F
+    F.waiters[buf] = nil
+    F.users[buf] = nil
+    j.mark.users[buf] = nil
+    if next(F.users) == nil and next(F.waiters) == nil then
+      S.jobs[id] = nil
+      if not j.overdue then
+        pcall(N.cancel, id)
+        S.inflight = S.inflight - 1
+        freed = true
+      end
+      drop_fit(F, j.avail)
+    end
+  end
+  local released = false
+  for _, P in pairs(S.cache) do
+    for _, F in pairs(P) do
+      F.waiters[buf] = nil
+      F.users[buf] = nil
+      if F.nat and F.nat.users[buf] then
+        F.nat.users[buf] = nil
+        released = true
+      end
+      for _, f in pairs(F.fit) do
+        if f.users and f.users[buf] then
+          f.users[buf] = nil
+          if f.b64 then released = true end
+        end
+      end
+      if next(F.users) == nil and not has_pending(F) then
+        drop_record(F)
+        released = true
+      end
+    end
+  end
+  if released then
+    -- room again: what the byte budget refused may fit now (asked once more)
+    S.dry = nil
+    for _, P in pairs(S.cache) do
+      for _, F in pairs(P) do
+        for a, f in pairs(F.fit) do
+          if f.budget then drop_fit(F, a) end
+        end
+      end
+    end
+  end
+  if freed then slots_freed(except) end
+end
+
+-- Every known buffer that is gone, also one wiped without its autocommands
+-- (no BufWipeout), but `keep`, the one being rendered.
+local function forget_gone(keep)
+  local gone
+  for buf in pairs(S.bufs) do
+    if buf ~= keep and not vim.api.nvim_buf_is_valid(buf) then
+      gone = gone or {}
+      gone[#gone + 1] = buf
+    end
+  end
+  if gone then
+    for _, buf in ipairs(gone) do forget(buf, keep) end
+  end
 end
 
 -- ── the render API ──────────────────────────────────────────────────────
@@ -900,8 +1111,11 @@ end
 function M.begin(nb, win, edit_idx)
   S.tick = S.tick + 1
   local B = buffer_state(nb)
-  watchdog(nb.buf)
+  B.t_begin = M._now()
+  B.ask = nil                                          -- this render does what was asked of it
   S.starved[nb.buf] = nil                              -- this render asks for what it can
+  forget_gone(nb.buf)
+  watchdog(nb.buf)
   local why = inactive(true)
   if not why and S.cell == nil then
     M.refresh_cell_px()
@@ -916,7 +1130,7 @@ function M.begin(nb, win, edit_idx)
   Image.check_hl()
   local fg = fg_hex()
   local vkey = ("%s|%dx%d|%s"):format(fg, S.cell.w, S.cell.h, tostring(S.cfg.scale))
-  if vkey ~= S.vkey then switch_variant(vkey) end
+  if vkey ~= S.vkey then switch_variant(vkey, nb.buf) end
   local seen, keys, at = scan_cells(B, nb, edit_idx)
   local top, bot
   if win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == nb.buf then
@@ -954,13 +1168,15 @@ function M.cell_done(cctx)
   B.cells[id] = cctx.n > 0 and cctx.n or nil
 end
 
--- After the cell loop: frees the slots of cells that are gone or no longer
--- markdown, evicts old cache records, and when transmits were held back,
--- asks for another render, but only when this one put an image on the
--- terminal that is still there: a render that cannot make progress does
--- not repeat itself.
+-- After the cell loop: notes what the render took, frees the slots of
+-- cells that are gone or no longer markdown, evicts old cache records, and
+-- when transmits were held back, asks for another render, but only when
+-- this one put an image on the terminal that is still there: a render that
+-- cannot make progress does not repeat itself.
 function M.finish(rctx)
   local B = rctx.B
+  local now = M._now()
+  B.dur = B.t_begin and now - B.t_begin or 0
   for id, n in pairs(B.cells) do
     if not rctx.seen[id] then
       for k = 1, n do free_slot(B, slot_key(B.buf, id, k)) end
@@ -974,64 +1190,18 @@ function M.finish(rctx)
   if rctx.deferred then
     for _, l in ipairs(rctx.landed) do
       if Image.is_cached(l[1], nil, "placeholder", l[2]) then
-        later_refresh(rctx.nb)
+        ask(B)
         break
       end
     end
   end
 end
 
--- BufWipeout: frees the buffer's slots and forgets it. The jobs that no
--- other notebook waits for are cancelled, and the records no other notebook
--- used are dropped; with no notebook left, the whole cache goes.
+-- BufWipeout: frees the buffer's slots and forgets it (see forget). A
+-- buffer wiped without its autocommands is forgotten by the next render of
+-- another notebook.
 function M.forget_buffer(buf)
-  local B = S.bufs[buf]
-  if B then free_buffer_slots(B) end
-  S.bufs[buf] = nil
-  later[buf] = nil
-  S.starved[buf] = nil
-  if next(S.bufs) == nil then
-    cancel_jobs()
-    empty_cache()
-    return
-  end
-  local N = native()
-  local freed = false
-  for id, j in pairs(S.jobs) do
-    local F = j.F
-    F.waiters[buf] = nil
-    F.users[buf] = nil
-    if next(F.users) == nil and next(F.waiters) == nil then
-      pcall(N.cancel, id)
-      S.jobs[id] = nil
-      S.inflight = math.max(0, S.inflight - 1)
-      drop_fit(F, j.avail)
-      freed = true
-    end
-  end
-  local dropped = false
-  for _, P in pairs(S.cache) do
-    for _, F in pairs(P) do
-      F.waiters[buf] = nil
-      F.users[buf] = nil
-      if next(F.users) == nil and not has_pending(F) then
-        drop_record(F)
-        dropped = true
-      end
-    end
-  end
-  if dropped then
-    -- room again: what the byte budget refused may fit now (asked once more)
-    S.dry = nil
-    for _, P in pairs(S.cache) do
-      for _, F in pairs(P) do
-        for a, f in pairs(F.fit) do
-          if f.budget then drop_fit(F, a) end
-        end
-      end
-    end
-  end
-  if freed then slots_freed() end
+  forget(buf, nil)
 end
 
 -- Frees every slot of every buffer, cancels every job and empties the cache
@@ -1048,9 +1218,14 @@ function M.reset()
 end
 
 -- For :checkhealth and tests. Never loads the library.
+-- pending: jobs whose answer is awaited; inflight: those of them that hold
+-- a job slot; overdue: the others (cancelled after JOB_MS, answer awaited).
 function M.status()
-  local pending = 0
-  for _ in pairs(S.jobs) do pending = pending + 1 end
+  local pending, overdue = 0, 0
+  for _, j in pairs(S.jobs) do
+    pending = pending + 1
+    if j.overdue then overdue = overdue + 1 end
+  end
   local slots = 0
   for _, B in pairs(S.bufs) do
     for _, n in pairs(B.cells) do slots = slots + n end
@@ -1070,6 +1245,8 @@ function M.status()
     records = S.n,
     bytes = S.bytes,
     pending = pending,
+    inflight = S.inflight,
+    overdue = overdue,
     slots = slots,
     stats = M.stats,
   }

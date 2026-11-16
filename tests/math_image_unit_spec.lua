@@ -11,10 +11,15 @@
 --    paths where images are off, what the source may call, and the cost of
 --    a cache hit. Then the bounds a hostile notebook meets: cells that share
 --    an id, the bytes of one answer, of the cache and of one render, what a
---    wiped notebook leaves, a full set of job slots with no timer, jobs that
---    never end, what reaches the log, the prelude's size, a library that
---    arrives later, a bare :hi clear, a cache over its record count, and a
---    notebook whose formulas all fail going idle.
+--    wiped notebook leaves, a full set of job slots with no timer, jobs past
+--    10 s (cancelled, their slot given back, their answer still taken),
+--    what reaches the log, the prelude's size, a library that arrives
+--    later, a bare :hi clear, a cache over its record count, a notebook
+--    whose formulas all fail going idle, the renders the module asks for
+--    (spaced by what a render costs, and coalesced), a new ink waking the
+--    notebooks that waited on dropped jobs, the byte budget counted by the
+--    results windows show, a buffer wiped without autocommands, macros
+--    past the 64th defining cell, and a width that is not a number.
 -- C  setup(): every bad value falls back to its default with one warning.
 --
 -- The terminal UI is simulated as in stream_writer_spec.lua: nvim_list_uis
@@ -258,11 +263,13 @@ local function slot(buf, id, n) return ("%d\31%s\31math%d"):format(buf, id, n) e
 
 local fake
 local REAL_NOW = MI._now
+local REAL_DEFER = MI._defer
 local count_refresh = Render.refresh
 -- a clean module with this stand-in and config, the library not asked yet
 local function fresh(f, cfg)
   Render.refresh = count_refresh
   MI._now = REAL_NOW
+  MI._defer = REAL_DEFER
   for buf in pairs(MI._S.bufs) do MI.forget_buffer(buf) end
   MI.reset()
   MI._native = f
@@ -363,6 +370,7 @@ section("M1. one formula: one job, then cache hits", function()
   chk("M1.5 a second render submits nothing", #fake.jobs == 1)
   local r1 = refreshed
   answer(fake.jobs[1], 3, 1, false)
+  vim.wait(1000, function() return refreshed > r1 end, 5)
   chk("M1.6 the completion refreshes the notebook that waited", refreshed == r1 + 1)
   reset_out()
   out = render(nb)
@@ -661,23 +669,25 @@ end)
 section("M7. back-pressure", function()
   fresh(new_fake())
   local blocks = {}
-  for k = 1, 65 do blocks[k] = "x_{" .. k .. "}" end
+  for k = 1, 257 do blocks[k] = "x_{" .. k .. "}" end
   local nb = new_nb({ md("b1", blocks) })
   activate(nb)
   local s0 = MI.stats.submits
   render(nb)
-  chk("M7.1 65 new blocks in one render: 64 submits", #fake.jobs == 64 and MI.stats.submits == s0 + 64)
-  local has65 = false
-  for _, j in ipairs(fake.jobs) do if j.data:sub(-6) == "x_{65}" then has65 = true end end
-  chk("M7.2 ...and the 65th waits", not has65 and MI.status().pending == 64)
+  chk("M7.1 257 new blocks in one render: 256 submits", #fake.jobs == 256 and MI.stats.submits == s0 + 256,
+    #fake.jobs)
+  local has257 = false
+  for _, j in ipairs(fake.jobs) do if j.data:sub(-7) == "x_{257}" then has257 = true end end
+  chk("M7.2 ...and the 257th waits", not has257 and MI.status().pending == 256 and MI.status().inflight == 256)
   answer(fake.jobs[1], 2, 1, false)
   render(nb)
-  chk("M7.3 a completion frees room: the 65th is asked for in the next render",
-    #fake.jobs == 65 and fake.jobs[65].data:sub(-6) == "x_{65}")
+  chk("M7.3 a completion frees room: the 257th is asked for in the next render",
+    #fake.jobs == 257 and fake.jobs[257].data:sub(-7) == "x_{257}")
 
+  -- no count of transmits per render: only its bytes
   fresh(new_fake())
   blocks = {}
-  for k = 1, 17 do blocks[k] = "y_{" .. k .. "}" end
+  for k = 1, 200 do blocks[k] = "y_{" .. k .. "}" end
   nb = new_nb({ md("t1", blocks) })
   activate(nb)
   render(nb)
@@ -686,16 +696,13 @@ section("M7. back-pressure", function()
   local t0, d0 = MI.stats.transmits, MI.stats.deferred
   local o = render(nb)
   local shown = 0
-  for k = 1, 17 do if o[1][k] then shown = shown + 1 end end
-  chk("M7.4 17 ready results in one render: 16 transmits",
-    n_tx() == 16 and MI.stats.transmits == t0 + 16 and shown == 16 and MI.stats.deferred == d0 + 1,
-    ("%d transmits, %d shown"):format(n_tx(), shown))
+  for k = 1, 200 do if o[1][k] then shown = shown + 1 end end
+  chk("M7.4 200 small results ready: one render sends them all (no count per render, only the bytes)",
+    n_tx() == 200 and MI.stats.transmits == t0 + 200 and shown == 200 and MI.stats.deferred == d0,
+    ("%d transmits, %d shown, %d held back"):format(n_tx(), shown, MI.stats.deferred - d0))
   reset_out()
-  o = render(nb)
-  chk("M7.5 the 17th goes out in the next render", n_tx() == 1 and o[1][17] ~= nil)
-  local r0 = refreshed
-  vim.wait(200, function() return refreshed > r0 end, 5)
-  chk("M7.6 a held-back block asked for a later render", refreshed > r0)
+  render(nb)
+  chk("M7.5 ...and the next render sends nothing", #ui_out == 0, #ui_out)
 end)
 
 section("M8. images off", function()
@@ -926,23 +933,28 @@ section("M12. cells that share an id", function()
     ("%d jobs, %d writes"):format(#fake.jobs - n0, #ui_out))
 
   -- held-back transmits after a render that got none onto the terminal
+  local L = MI._limits
+  local saved_rb = L.render_bytes
   fresh(new_fake())
+  L.render_bytes = 1500
   local blocks = {}
-  for k = 1, 17 do blocks[k] = "p_{" .. k .. "}" end
+  for k = 1, 3 do blocks[k] = "p_{" .. k .. "}" end
   local nb4 = new_nb({ md("q1", blocks) })
   activate(nb4)
   render(nb4)
-  for _, j in ipairs(fake.jobs) do answer(j, 2, 1, false) end
-  wait_ms(50)
+  for _, j in ipairs(fake.jobs) do answer(j, 2, 1, false, { b64 = blob(1000) }) end
+  wait_ms(80)
   local real = Image.ensure_transmitted
   Image.ensure_transmitted = function(_, _, cb) cb(nil) end      -- a transmit that never lands
   local f0, d0, t0 = refreshed, MI.stats.deferred, MI.stats.transmits
   local okr, err = pcall(render, nb4)
   Image.ensure_transmitted = real
-  wait_ms(80)
+  L.render_bytes = saved_rb
+  wait_ms(120)
   chk("M12.7 a render that held transmits back but put no image on the terminal asks for no other render",
-    okr and MI.stats.transmits == t0 + 16 and MI.stats.deferred == d0 + 1 and refreshed == f0,
-    okr and ("%d refreshes"):format(refreshed - f0) or tostring(err))
+    okr and MI.stats.transmits == t0 + 1 and MI.stats.deferred == d0 + 2 and refreshed == f0,
+    okr and ("%d transmits, %d held back, %d refreshes"):format(MI.stats.transmits - t0,
+      MI.stats.deferred - d0, refreshed - f0) or tostring(err))
 end)
 
 section("M13. byte bounds", function()
@@ -1090,76 +1102,143 @@ end)
 section("M15. every job slot taken", function()
   fresh(new_fake())
   local blocks = {}
-  for k = 1, 64 do blocks[k] = "w_{" .. k .. "}" end
+  for k = 1, 256 do blocks[k] = "w_{" .. k .. "}" end
   local A = new_nb({ md("wa", blocks) })
   local Bn = new_nb({ md("wb", { "late" }) })
   activate(A)
   render(A)
   local f0 = refreshed
   local ob = render(Bn)
-  chk("M15.1 a block that finds every slot taken is text, with no job", ob[1][1] == nil and #fake.jobs == 64)
+  chk("M15.1 a block that finds every slot taken is text, with no job", ob[1][1] == nil and #fake.jobs == 256)
   wait_ms(120)
   chk("M15.2 nothing renders again by itself while the slots stay taken (no timer)", refreshed == f0,
     refreshed - f0)
   local rb = refreshes_of(Bn.buf)
   answer(fake.jobs[1], 2, 1, false)
+  vim.wait(1000, function() return refreshes_of(Bn.buf) > rb end, 5)
   chk("M15.3 a completion renders the notebook that waited for a slot, though not for that job",
     refreshes_of(Bn.buf) == rb + 1)
   render(Bn)
-  chk("M15.4 ...and its block takes the free slot", #fake.jobs == 65 and fake.jobs[65].data:sub(-4) == "late")
+  chk("M15.4 ...and its block takes the free slot", #fake.jobs == 257 and fake.jobs[257].data:sub(-4) == "late")
 end)
 
-section("M16. a job that never ends", function()
+-- the slot count against the jobs: in flight = the jobs not overdue, never below 0
+local function slots_agree()
+  local n = 0
+  for _, j in pairs(MI._S.jobs) do if not j.overdue then n = n + 1 end end
+  return MI._S.inflight == n and n >= 0, ("inflight %d, jobs not overdue %d"):format(MI._S.inflight, n)
+end
+-- the jobs asked for a formula (no prelude: the request ends in "\n\n" .. tex)
+local function jobs_for(tex)
+  local n = 0
+  for _, j in ipairs(fake.jobs) do if j.data:sub(-(#tex + 2)) == "\n\n" .. tex then n = n + 1 end end
+  return n
+end
+
+section("M16. a job in flight past 10 s: cancelled, its slot given back, no verdict", function()
   fresh(new_fake())
   local clock = 0
   MI._now = function() return clock end
   MI._S.watch_at = nil
-  local nb = new_nb({ md("wd", { "slow" }) })
+  local l0 = MI.stats.late or 0
+  local names = { "late", "never", "cancelled", "broken" }
+  local nb = new_nb({ md("wd", names) })
   activate(nb)
   render(nb)
-  local j1 = fake.jobs[1]
+  local by = {}
+  for _, j in ipairs(fake.jobs) do by[j.data:match("%a+$")] = j end
   clock = 600
-  nb.cells[1].blocks = { "slow", "slow2" }
+  nb.cells[1].blocks = { "late", "never", "cancelled", "broken", "young" }
   render(nb)
-  local j2 = fake.jobs[2]
+  for _, j in ipairs(fake.jobs) do by[j.data:match("%a+$")] = j end
   clock = 5000
   render(nb)
-  chk("M16.1 a job in flight for 5 s is left alone", j1 and j2 and not was_cancelled(j1.id) and MI.status().pending == 2)
+  local st = MI.status()
+  chk("M16.1 a job in flight for 5 s is left alone", by.late and by.young and not was_cancelled(by.late.id)
+    and st.pending == 5 and st.inflight == 5 and st.overdue == 0)
   clock = 10500
-  local t0 = MI.stats.timeouts or 0
+  local t0, f0 = MI.stats.timeouts, MI.stats.fails
   local o = render(nb)
-  chk("M16.2 past 10 s the next render cancels it and frees its slot",
-    j1 and was_cancelled(j1.id) and MI.status().pending == 1 and (MI.stats.timeouts or 0) == t0 + 1)
-  chk("M16.3 ...and its block is text", o[1][1] == nil)
+  st = MI.status()
+  local four = true
+  for _, k in ipairs(names) do if not (by[k] and was_cancelled(by[k].id)) then four = false end end
+  chk("M16.2 past 10 s the next render cancels the jobs that old and gives their slots back",
+    four and not was_cancelled(by.young.id) and st.inflight == 1 and st.overdue == 4
+      and MI.stats.timeouts == t0 + 4, vim.inspect({ st.inflight, st.overdue, MI.stats.timeouts - t0 }))
+  chk("M16.3 ...and decides nothing: still pending, no failure, text, not asked for again",
+    st.pending == 5 and MI.stats.fails == f0 and o[1][1] == nil and o[1][2] == nil and #fake.jobs == 5)
+  chk("M16.3b ...and the slot count agrees with the jobs", slots_agree())
   clock = 10800
   render(nb)
-  chk("M16.4 the jobs are looked at no more than once a second",
-    j2 and not was_cancelled(j2.id) and MI.status().pending == 1)
-  clock = 11600
+  chk("M16.4 the jobs are looked at no more than once a second", not was_cancelled(by.young.id))
+  clock = 11700
   render(nb)
-  chk("M16.5 ...a second later the other one goes too", j2 and was_cancelled(j2.id) and MI.status().pending == 0)
-  local n0 = #fake.jobs
-  for _ = 1, 3 do render(nb) end
-  if j1 then answer(j1, 2, 1, false) end
-  o = render(nb)
-  chk("M16.6 a timed-out formula is not asked for again in this variant, and its late answer is ignored",
-    #fake.jobs == n0 and o[1][1] == nil and o[1][2] == nil)
+  st = MI.status()
+  chk("M16.5 ...a second later the younger one goes overdue too",
+    was_cancelled(by.young.id) and st.inflight == 0 and st.overdue == 5 and slots_agree())
 
-  -- every slot held by a job that never ends, and a 65th block waiting
+  -- the answers decide
+  answer(by.late, 2, 1, false)
+  answer(by.young, 3, 1, false)
+  fail(by.cancelled, "CANCELLED", 3)
+  fail(by.broken, "math: parse: Undefined control sequence: \\broken")
+  st = MI.status()
+  chk("M16.6 answers to overdue jobs free no slot a second time: in flight 0, not below",
+    st.inflight == 0 and st.pending == 1 and st.overdue == 1 and slots_agree(),
+    vim.inspect({ st.inflight, st.pending, st.overdue }))
+  local n0 = #fake.jobs
+  o = render(nb)
+  chk("M16.7 a result that comes late is kept and shown", o[1][1] ~= nil and o[1][5] ~= nil
+    and (MI.stats.late or 0) == l0 + 2, vim.inspect({ o[1][1] ~= nil, o[1][5] ~= nil, MI.stats.late }))
+  chk("M16.8 a job that answers CANCELLED never ran: the next render asks for it again",
+    #fake.jobs == n0 + 1 and jobs_for("cancelled") == 2 and o[1][3] == nil)
+  chk("M16.9 an error is an error: text, and not asked for again", o[1][4] == nil and jobs_for("broken") == 1)
+  for _ = 1, 3 do
+    clock = clock + 20000
+    o = render(nb)
+  end
+  st = MI.status()
+  chk("M16.10 one that never answers stays pending: text, never asked for again, holding no slot",
+    o[1][2] == nil and jobs_for("never") == 1 and st.overdue >= 1 and slots_agree(),
+    vim.inspect({ jobs_for("never"), st.overdue, st.inflight }))
+
+  -- the overdue job's notebook wiped, then a variant switch with an overdue job out
+  local nb_w = new_nb({ md("ww", { "gone" }) })
+  render(nb_w)
+  local jg = fake.jobs[#fake.jobs]
+  clock = clock + 20000
+  render(nb)
+  local in0 = MI.status().inflight
+  MI.forget_buffer(nb_w.buf)
+  chk("M16.11 a notebook wiped while its job is overdue: the job goes, the slot count stays right",
+    jg.data:sub(-4) == "gone" and MI._S.jobs[jg.id] == nil and MI.status().inflight == in0 and slots_agree())
+  vim.cmd("hi JupynvimMathImage guifg=#00ff00")
+  local n1 = #fake.jobs
+  render(nb)
+  st = MI.status()
+  chk("M16.12 a new colour drops every job, overdue ones too, and asks for the block again",
+    st.overdue == 0 and jobs_for("never") == 2 and #fake.jobs > n1 and slots_agree())
+  answer(by.never, 2, 1, false)
+  chk("M16.13 ...and the old job's answer is ignored", MI.status().records == 5 and slots_agree())
+  vim.cmd("hi JupynvimMathImage guifg=#c0caf5")
+
+  -- every slot held by a job that goes overdue, and a 257th block waiting
   fresh(new_fake())
   MI._now = function() return clock end
   MI._S.watch_at = nil
   clock = 20000
   local blocks = {}
-  for k = 1, 65 do blocks[k] = "h_{" .. k .. "}" end
+  for k = 1, 257 do blocks[k] = "h_{" .. k .. "}" end
   local nb2 = new_nb({ md("wh", blocks) })
   activate(nb2)
   render(nb2)
-  chk("M16.7 64 jobs, and the 65th block waits", #fake.jobs == 64)
+  chk("M16.14 256 jobs, and the 257th block waits", #fake.jobs == 256)
   clock = 31000
   render(nb2)
-  chk("M16.8 once they time out, the same render gives the waiting block a slot",
-    #fake.jobs == 65 and fake.jobs[65].data:sub(-6) == "h_{65}" and MI.status().pending == 1)
+  st = MI.status()
+  chk("M16.15 once they go overdue, the same render gives the waiting block a slot",
+    #fake.jobs == 257 and fake.jobs[257].data:sub(-7) == "h_{257}" and st.inflight == 1
+      and st.overdue == 256 and st.pending == 257 and slots_agree())
   MI._now = REAL_NOW
 end)
 
@@ -1198,7 +1277,8 @@ section("M18. the macro prelude's bounds", function()
   fresh(new_fake())
   local cells = {}
   for k = 1, 100 do cells[k] = md("d" .. k, {}, "\\def\\m" .. k .. "{" .. k .. "}") end
-  cells[101] = md("f", { "\\m1" }, "$$\\m1$$")
+  cells[64].blocks = { "\\m1" }                          -- the 64th defining cell: its prelude is whole
+  cells[101] = md("f", { "\\m2" }, "$$\\m2$$")
   local nb = new_nb(cells)
   activate(nb)
   render(nb)
@@ -1206,20 +1286,24 @@ section("M18. the macro prelude's bounds", function()
   for k = 1, 64 do srcs[k] = cells[k].source end
   local want = table.concat(srcs, "\n")
   local j = fake.jobs[1]
-  chk("M18.1 the prelude is the first 64 macro-defining cells; the ones after are left out",
-    j ~= nil and req_field(j.data, "pre") == tostring(#want) and j.data:sub(-(#want + 3)) == want .. "\\m1"
+  chk("M18.1 the prelude is the first 64 macro-defining cells",
+    #fake.jobs == 1 and req_field(j.data, "pre") == tostring(#want) and j.data:sub(-(#want + 3)) == want .. "\\m1"
       and not j.data:find("\\def\\m65{", 1, true), j and req_field(j.data, "pre"))
   local big = {}
   for k = 1, 3 do big[k] = "\\def\\b" .. k .. "{" .. ("x"):rep(30000) .. "}" end
   fresh(new_fake())
   local nb2 = new_nb({ md("e1", {}, big[1]), md("e2", { "\\b1" }, "$$\\b1$$"), md("e3", {}, big[2]),
-                       md("e4", {}, big[3]), md("e5", { "\\b2" }, "$$\\b2$$") })
+                       md("e4", { "\\b2" }, "$$\\b2$$"), md("e5", {}, big[3]), md("e6", { "\\b1" }, "$$\\b1$$") })
   activate(nb2)
-  render(nb2)
+  local c0 = MI.stats.prelude_cut or 0
+  local o = render(nb2)
   local pre = {}
   for _, jj in ipairs(fake.jobs) do pre[jj.data:sub(-3)] = req_field(jj.data, "pre") end
-  chk("M18.2 past 64 KiB the later definitions are left out and the earlier ones kept",
-    pre["\\b1"] == tostring(#big[1]) and pre["\\b2"] == tostring(#big[1] + 1 + #big[2]), vim.inspect(pre))
+  chk("M18.2 within 64 KiB every definition above a formula is in its prelude",
+    #fake.jobs == 2 and pre["\\b1"] == tostring(#big[1]) and pre["\\b2"] == tostring(#big[1] + 1 + #big[2]),
+    vim.inspect(pre))
+  chk("M18.3 a formula below the cell that would pass 64 KiB is text, with no job",
+    o[6][1] == nil and (MI.stats.prelude_cut or 0) == c0 + 1, vim.inspect({ #fake.jobs, MI.stats.prelude_cut }))
 end)
 
 section("M19. the library arrives later", function()
@@ -1328,6 +1412,242 @@ section("M22. a notebook whose formulas all fail", function()
     rendered == r0 and refreshed == rf0 and #ui_out == 0,
     ("%d renders, %d refreshes, %d writes"):format(rendered - r0, refreshed - rf0, #ui_out))
   Render.refresh = count_refresh
+end)
+
+section("M23. the renders the module asks for: spaced, and coalesced", function()
+  fresh(new_fake())
+  local clock = 1000
+  MI._now = function() return clock end
+  local defers = {}
+  MI._defer = function(fn, ms) defers[#defers + 1] = { fn = fn, ms = ms } end
+  local nb = new_nb({ md("sp", { "s_{1}", "s_{2}", "s_{3}", "s_{4}", "s_{5}", "s_{6}" }) })
+  activate(nb)
+  -- a render as render.lua makes one, that takes `ms` on the clock
+  local function render_for(ms)
+    local rctx = MI.begin(nb)
+    local cctx = MI.cell(rctx, nb.cells[1], 1)
+    for k, tex in ipairs(nb.cells[1].blocks) do
+      cctx.math_block(tex, { first = k * 3, last = k * 3 + 2, indent = 0, width = 80 })
+    end
+    MI.cell_done(cctx)
+    clock = clock + ms
+    MI.finish(rctx)
+  end
+  local function new_formula(tex)
+    local b = nb.cells[1].blocks
+    b[#b + 1] = tex
+  end
+  render_for(200)                                     -- begins at 1000, takes 200 ms
+  local r0 = refreshes_of(nb.buf)
+  clock = 1250
+  for k = 1, 5 do answer(fake.jobs[k], 2, 1, false) end
+  chk("M23.1 five completions after a render of 200 ms: no render at once, one asked for 3 x 200 ms after it began",
+    refreshes_of(nb.buf) == r0 and #defers == 1 and defers[1].ms == 350,
+    vim.inspect({ refreshes_of(nb.buf) - r0, #defers, defers[1] and defers[1].ms }))
+  defers[1].fn()
+  chk("M23.2 when it is due, that one render is asked for", refreshes_of(nb.buf) == r0 + 1)
+  answer(fake.jobs[6], 2, 1, false)
+  chk("M23.3 a request made before that render begins rides on it", #defers == 1 and refreshes_of(nb.buf) == r0 + 1)
+
+  clock = 1600
+  new_formula("s_{7}")
+  render_for(500)                                     -- 3 x 500 is more than a second
+  clock = 2110
+  answer(fake.jobs[#fake.jobs], 2, 1, false)
+  chk("M23.4 after a render of 500 ms the wait is capped at a second from its start",
+    #defers == 2 and defers[2].ms == 1600 + 1000 - 2110, defers[2] and defers[2].ms)
+
+  -- a render someone else causes in the meantime does what was asked
+  clock = 3000
+  render_for(1)                                       -- the user's: never held back
+  local r1 = refreshes_of(nb.buf)
+  defers[2].fn()
+  chk("M23.5 a render that began after the request answers it: the request then renders nothing",
+    refreshes_of(nb.buf) == r1)
+  new_formula("s_{8}")
+  render_for(1)
+  clock = clock + 5
+  answer(fake.jobs[#fake.jobs], 2, 1, false)
+  chk("M23.6 after a render of 1 ms the wait is the 30 ms floor", #defers == 3 and defers[3].ms == 30 - 6,
+    defers[3] and defers[3].ms)
+  defers[3].fn()
+  new_formula("s_{9}")
+  clock = clock + 100
+  render_for(10)
+  clock = clock + 500
+  local r2 = refreshes_of(nb.buf)
+  answer(fake.jobs[#fake.jobs], 2, 1, false)
+  chk("M23.7 a request past the wait renders at once", #defers == 3 and refreshes_of(nb.buf) == r2 + 1)
+  MI._now, MI._defer = REAL_NOW, REAL_DEFER
+end)
+
+section("M24. a new ink wakes the notebooks that waited on its dropped jobs", function()
+  fresh(new_fake())
+  local blocks = {}
+  for k = 1, 257 do blocks[k] = "n_{" .. k .. "}" end
+  local A = new_nb({ md("na", blocks) })              -- 256 jobs and one block waiting for a slot
+  local Bn = new_nb({ md("nb", {}, "text only") })
+  activate(A)
+  render(A)
+  render(Bn)
+  chk("M24.0 A has every slot and waits for one more", #fake.jobs == 256 and MI._S.starved[A.buf] == true)
+  live(A)
+  vim.cmd("hi JupynvimMathImage guifg=#123456")
+  local ra, n0 = refreshes_of(A.buf), #fake.jobs
+  render(Bn)                                          -- B's render switches the variant
+  chk("M24.1 B's render drops A's jobs", MI.status().pending == 0 and was_cancelled(fake.jobs[1].id))
+  vim.wait(1000, function() return #fake.jobs > n0 end, 5)
+  chk("M24.2 A renders again by itself and asks for its formulas in the new ink",
+    refreshes_of(A.buf) >= ra + 1 and #fake.jobs == n0 + 256
+      and req_field(fake.jobs[#fake.jobs].data, "fg") == "#123456",
+    vim.inspect({ refreshes_of(A.buf) - ra, #fake.jobs - n0 }))
+  local answered = n0
+  local function all_shown()
+    local P = MI._S.cache[""]
+    for k = 1, 257 do
+      local F = P and P[blocks[k]]
+      if not (F and F.nat and Image.is_cached(slot(A.buf, "na", k), nil, "placeholder", F.nat.id)) then
+        return false
+      end
+    end
+    return true
+  end
+  vim.wait(3000, function()
+    while answered < #fake.jobs do
+      answered = answered + 1
+      answer(fake.jobs[answered], 2, 1, false)
+    end
+    return all_shown()
+  end, 5)
+  chk("M24.3 ...and gets every image without any other event", all_shown(), ("%d jobs"):format(#fake.jobs - n0))
+  Render.refresh = count_refresh
+  vim.cmd("hi JupynvimMathImage guifg=#c0caf5")
+end)
+
+section("M25. the byte budget counts the results that windows show", function()
+  local L = MI._limits
+  local saved = L.cache_bytes
+  local ok, err = pcall(function()
+    local U = 4000
+    L.cache_bytes = 3.5 * U
+    fresh(new_fake())
+    local nb = new_nb({ md("rb", { "q1", "q2", "q3" }) })
+    activate(nb)
+    render(nb, { width = 80 })
+    for _, j in ipairs(fake.jobs) do answer(j, 30, 1, false, { b64 = blob(U) }) end
+    local o = render(nb, { width = 80 })
+    chk("M25.1 three formulas at their natural 30 columns fill most of the budget",
+      o[1][1] and o[1][2] and o[1][3] and MI.status().bytes == 3 * U)
+    local b0 = MI.stats.budget
+    o = render(nb, { width = 20 })
+    chk("M25.2 a window of 20 columns asks for each formula at that width", #fake.jobs == 6
+      and o[1][1] == nil and req_field(fake.jobs[6].data, "max") == "20 60")
+    for k = 4, 6 do answer(fake.jobs[k], 20, 1, true, { b64 = blob(U) }) end
+    o = render(nb, { width = 20 })
+    chk("M25.3 the results at 30 columns, which no window shows now, make room: every block is an image again",
+      o[1][1] ~= nil and o[1][2] ~= nil and o[1][3] ~= nil and MI.stats.budget == b0
+        and MI.status().bytes <= L.cache_bytes,
+      vim.inspect({ MI.stats.budget - b0, MI.status().bytes }))
+    chk("M25.4 ...and the formulas' records stay, only those results went", MI.status().records == 3)
+    -- two notebooks share a formula: the result the other one shows keeps its bytes
+    fresh(new_fake())
+    L.cache_bytes = 3.5 * U
+    local A = new_nb({ md("ra", { "p1", "p2" }) })
+    local Bn = new_nb({ md("rc", { "p1" }) })
+    activate(A)
+    render(A, { width = 80 })
+    for _, j in ipairs(fake.jobs) do answer(j, 30, 1, false, { b64 = blob(U) }) end
+    render(A, { width = 80 })
+    render(Bn, { width = 80 })
+    render(A, { width = 20 })
+    for k = 3, #fake.jobs do answer(fake.jobs[k], 20, 1, true, { b64 = blob(U) }) end
+    local oA = render(A, { width = 20 })
+    local oB = render(Bn, { width = 80 })
+    local P = MI._S.cache[""] or {}
+    chk("M25.5 two notebooks share a formula: the narrow one's images come in, the wide one keeps its own",
+      oA[1][1] ~= nil and oA[1][2] ~= nil and oB[1][1] ~= nil and MI.status().bytes <= L.cache_bytes,
+      vim.inspect({ oA[1][1] ~= nil, oA[1][2] ~= nil, oB[1][1] ~= nil, MI.status().bytes }))
+    chk("M25.6 ...the result only the narrowed notebook used went, the shared one's stayed",
+      P.p1 and P.p1.nat ~= nil and P.p2 and P.p2.nat == nil)
+  end)
+  L.cache_bytes = saved
+  chk("M25 ran to the end", ok, tostring(err))
+end)
+
+section("M26. a notebook wiped without its autocommands", function()
+  fresh(new_fake())
+  local A = new_nb({ md("ga", { "a1", "a2" }) })
+  local Bn = new_nb({ md("gb", { "b1" }) })
+  activate(A)
+  render(A)
+  render(Bn)
+  for _, j in ipairs(fake.jobs) do answer(j, 2, 1, false) end
+  render(A)
+  render(Bn)
+  local ka = slot(A.buf, "ga", 1)
+  chk("M26.0 both notebooks show their images", Image._placements[ka] ~= nil and MI.status().records == 3
+    and MI.status().slots == 3)
+  local abuf = A.buf
+  vim.cmd("noautocmd bwipeout! " .. abuf)
+  render(Bn)
+  local st = MI.status()
+  chk("M26.1 the next render of another notebook forgets it: its slots, records and bytes go",
+    MI._S.bufs[abuf] == nil and Image._placements[ka] == nil and st.records == 1 and st.slots == 1
+      and st.bytes == #PNG, vim.inspect({ st.records, st.slots, st.bytes }))
+end)
+
+section("M27. macros past the 64th defining cell", function()
+  fresh(new_fake())
+  local cells = {}
+  for k = 1, 70 do cells[k] = md("d" .. k, {}, "\\def\\m" .. k .. "{" .. k .. "}") end
+  cells[1].source = "\\newcommand{\\R}{\\mathbb{R}}"
+  cells[10].blocks = { "\\R^{10}" }
+  cells[64].blocks = { "\\R^{64}" }
+  cells[66].source = "\\renewcommand{\\R}{\\mathbb{Q}}"
+  cells[68].blocks = { "\\R^{68}" }
+  cells[71] = md("tail", { "x^{71}" }, "$$x^{71}$$")
+  local nb = new_nb(cells)
+  activate(nb)
+  local c0 = MI.stats.prelude_cut or 0
+  local o = render(nb)
+  local tex_of = {}
+  for _, j in ipairs(fake.jobs) do tex_of[#tex_of + 1] = j.data:match("\\R%^{%d+}$") or j.data:match("x%^{%d+}$") end
+  chk("M27.1 the formulas within the first 64 defining cells are asked for",
+    #fake.jobs == 2 and vim.tbl_contains(tex_of, "\\R^{10}") and vim.tbl_contains(tex_of, "\\R^{64}"),
+    vim.inspect(tex_of))
+  chk("M27.2 below the 65th, a formula that a left-out \\renewcommand changes is text, with no job",
+    o[68][1] == nil and not vim.tbl_contains(tex_of, "\\R^{68}") and (MI.stats.prelude_cut or 0) >= c0 + 1)
+  chk("M27.3 ...and so is every display formula under it", o[71][1] == nil and not vim.tbl_contains(tex_of, "x^{71}")
+    and (MI.stats.prelude_cut or 0) == c0 + 2)
+  for _, j in ipairs(fake.jobs) do answer(j, 2, 1, false) end
+  o = render(nb)
+  chk("M27.4 the formulas above it are images", o[10][1] ~= nil and o[64][1] ~= nil and o[68][1] == nil)
+  for k = 2, 7 do cells[k].source = "prose" end        -- 64 defining cells again: nothing left out
+  render(nb)
+  local j68
+  for _, j in ipairs(fake.jobs) do if j.data:sub(-7) == "\\R^{68}" then j68 = j end end
+  chk("M27.5 with 64 defining cells the formula below has its whole prelude, the \\renewcommand in it",
+    j68 ~= nil and j68.data:find("\\renewcommand{\\R}{\\mathbb{Q}}", 1, true) ~= nil)
+end)
+
+section("M28. a width that is not a finite number", function()
+  fresh(new_fake())
+  local nb = new_nb({ md("nw", { "a" }) })
+  activate(nb)
+  local rctx = MI.begin(nb)
+  local cctx = MI.cell(rctx, nb.cells[1], 1)
+  local got, errs = {}, {}
+  for i, sp in ipairs({ { width = 0 / 0 }, { width = math.huge }, { width = -math.huge },
+                        { width = 80, indent = 0 / 0 }, { width = 80, indent = -math.huge } }) do
+    sp.first, sp.last, sp.indent = 3 * i, 3 * i + 1, sp.indent or 0
+    local okc, r = pcall(cctx.math_block, "a" .. i, sp)
+    got[i] = r
+    if not okc then errs[#errs + 1] = tostring(r) end
+  end
+  MI.cell_done(cctx)
+  MI.finish(rctx)
+  chk("M28.1 a width of NaN or an infinity, or such an indent: text, no error, no job",
+    #errs == 0 and next(got) == nil and #fake.jobs == 0, vim.inspect({ errs, #fake.jobs }))
 end)
 
 -- ── C. setup() ──────────────────────────────────────────────────────────
