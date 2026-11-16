@@ -14,11 +14,14 @@
 //!
 //! The TeX and the macro source are notebook content, so every stage treats
 //! its input as hostile: the preprocessor is linear (its scans share a work
-//! budget), RaTeX bounds nesting, expansions and layout work, every number
-//! of the layout is checked before it sizes anything, the canvas and the
-//! ink drawn on it are capped, buffers are reserved fallibly, and the cancel
-//! flag is read between stages. A failure is a [`MathErr`]; the caller then
-//! shows the formula as text.
+//! budget) and turns off RaTeX's chemistry parser (`\ce`, `\pu`), whose time
+//! grows with the square of its input and cannot be cancelled
+//! ([`preprocess::NO_CHEMISTRY`]), RaTeX bounds nesting, expansions and
+//! layout work, every number of the layout is checked before it sizes
+//! anything, the canvas and the ink drawn on it are capped, so is the
+//! encoded image ([`MAX_PNG`]), buffers are reserved fallibly, and the
+//! cancel flag is read between stages. A failure is a [`MathErr`]; the
+//! caller then shows the formula as text.
 //!
 //! `JNV_KIND_MATH_CELL` reports the terminal's size in cells and pixels
 //! ([`cell`]).
@@ -47,6 +50,10 @@ pub const MAX_PIXELS: u64 = 8_000_000;
 pub const MAX_BOX_EM: f64 = 10_000.0;
 /// Smallest scale-to-fit factor.
 pub const MIN_SHRINK: f64 = 0.5;
+/// Bytes of one encoded PNG. A formula's image is a few kilobytes; one of
+/// many coloured glyphs on a large canvas can pass a megabyte, which the
+/// editor would keep and send to the terminal, so it is a `Size` error.
+pub const MAX_PNG: usize = 1024 * 1024;
 
 /// The most bytes of detail an error message carries.
 const MAX_DETAIL: usize = 240;
@@ -64,8 +71,8 @@ pub enum MathErr {
     Layout(String),
     /// A glyph no embedded font has.
     Glyph(String),
-    /// Too wide, too tall, too many pixels, too much ink, or a box that is
-    /// not finite.
+    /// Too wide, too tall, too many pixels, too much ink, a box that is not
+    /// finite, or an encoded image above [`MAX_PNG`].
     Size(String),
     /// Nothing to draw.
     Empty,
@@ -158,6 +165,7 @@ pub fn typeset(req: &wire::Request<'_>, cancel: &AtomicBool) -> Result<Typeset, 
     let rgba = raster::draw(&dl, &cv, cancel)?;
     stop(cancel)?;
     let png = pngenc::encode_rgba(&rgba, cv.width, cv.height)?;
+    check_png_len(png.len())?;
     Ok(Typeset {
         width: cv.width,
         height: cv.height,
@@ -168,6 +176,15 @@ pub fn typeset(req: &wire::Request<'_>, cancel: &AtomicBool) -> Result<Typeset, 
         shrunk: cv.shrunk,
         png,
     })
+}
+
+/// An encoded image of `n` bytes is at most [`MAX_PNG`].
+fn check_png_len(n: usize) -> Result<(), MathErr> {
+    if n > MAX_PNG {
+        Err(MathErr::Size(format!("the image is {n} bytes, at most {MAX_PNG}")))
+    } else {
+        Ok(())
+    }
 }
 
 fn stop(c: &AtomicBool) -> Result<(), MathErr> {
@@ -270,6 +287,28 @@ mod tests {
         assert!(typeset(&req, &never).is_ok());
         let err = typeset(&request("", "x \\in \\RR"), &never).unwrap_err();
         assert_eq!(err.class(), "parse", "{err:?}");
+    }
+
+    #[test]
+    fn chemistry_is_a_parse_error() {
+        let never = AtomicBool::new(false);
+        let want = MathErr::Parse("Undefined control sequence: \\jnvnomhchem".into());
+        assert_eq!(typeset(&request("", "\\ce{H2O}"), &never), Err(want.clone()));
+        assert_eq!(typeset(&request("", "x + \\pu{1 kg}"), &never), Err(want.clone()));
+        assert_eq!(typeset(&request("$\\newcommand{\\w}{\\ce{H2O}}$", "\\w"), &never), Err(want));
+        // Formulas without it are untouched, a leading letter included.
+        assert!(typeset(&request("", "ce + pu"), &never).is_ok());
+        assert!(typeset(&request("\\def\\c{e}", "x\\c"), &never).is_ok());
+    }
+
+    #[test]
+    fn an_encoded_image_above_the_cap_is_a_size_error() {
+        assert_eq!(check_png_len(0), Ok(()));
+        assert_eq!(check_png_len(MAX_PNG), Ok(()));
+        assert_eq!(
+            check_png_len(MAX_PNG + 1).unwrap_err().message(),
+            "math: size: the image is 1048577 bytes, at most 1048576"
+        );
     }
 
     #[test]

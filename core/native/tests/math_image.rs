@@ -11,7 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use jupynvim::abi::*;
-use jupynvim::mathimage::{MAX_PRELUDE, MAX_TEX};
+use jupynvim::mathimage::{MAX_PNG, MAX_PRELUDE, MAX_TEX};
 use jupynvim::*;
 
 static LOCK: Mutex<()> = Mutex::new(());
@@ -112,6 +112,36 @@ fn req(tex: &str) -> Vec<u8> {
 }
 
 const EXAMPLE: &[u8] = b"JNM 1\nfg #c0caf5\ncell 14 30\nscale 1\nmax 100 60\npre 0\ntex 3\n\nx^2";
+
+/// A markdown cell that defines `\ra` to `\rl`, each `per_row` glyphs of
+/// random colours, and a short array of `rows` of them: a formula of a few
+/// hundred bytes whose image is as large as the canvas allows, and hard to
+/// compress.
+fn coloured_rows(per_row: usize, rows: usize) -> (String, String) {
+    let colours = [
+        "red", "blue", "green", "cyan", "magenta", "yellow", "orange", "purple", "teal", "gray", "pink", "lime", "olive",
+        "brown", "violet", "white",
+    ];
+    let glyphs = b"MWQ@8BRgmwkGHNKXZSDE";
+    let mut seed = 7u32;
+    let mut pick = |n: usize| {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        (seed >> 16) as usize % n
+    };
+    let mut cell = String::from("$");
+    for m in b'a'..=b'l' {
+        cell.push_str(&format!(r"\def\r{}{{", m as char));
+        for _ in 0..per_row {
+            let c = colours[pick(colours.len())];
+            let g = glyphs[pick(glyphs.len())] as char;
+            cell.push_str(&format!(r"\textcolor{{{c}}}{{{g}}}"));
+        }
+        cell.push_str("}\n");
+    }
+    cell.push('$');
+    let body: String = (0..rows).map(|k| format!(r"\r{}\\", (b'a' + (k % 12) as u8) as char)).collect();
+    (cell, format!(r"\begin{{array}}{{l}}{body}\end{{array}}"))
+}
 
 /// A response, checked line by line: (width, height, cols, rows, baseline, png).
 fn parse_response(out: &[u8]) -> (u32, u32, u32, u32, u32, Vec<u8>) {
@@ -218,6 +248,105 @@ fn every_error_class_through_the_boundary() {
         let msg = String::from_utf8_lossy(&out);
         assert_eq!(st, ERR, "{prefix}: {msg}");
         assert!(msg.starts_with(prefix), "wanted {prefix:?}, got {msg:?}");
+    }
+    unsafe { jnv_close(ctx) };
+}
+
+#[test]
+fn an_image_above_a_megabyte_is_a_size_error() {
+    let _l = start();
+    let ctx = open(1);
+    // 49 rows of 52 coloured glyphs: 96x59 cells of 14x30 pixels.
+    let (cell, tex) = coloured_rows(52, 49);
+    let (st, out) = call(ctx, KIND_MATH, &request((14, 30), (100, 60), cell.as_bytes(), tex.as_bytes()));
+    assert_eq!(st, ERR, "{}", String::from_utf8_lossy(&out[..out.len().min(200)]));
+    let msg = String::from_utf8_lossy(&out).into_owned();
+    let n: usize = msg
+        .strip_prefix("math: size: the image is ")
+        .and_then(|m| m.strip_suffix(&format!(" bytes, at most {MAX_PNG}")))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{msg}"));
+    assert!(n > MAX_PNG, "{msg}");
+    assert_eq!(MAX_PNG, 1_048_576);
+    // The same rows, fewer of them, fit.
+    let (cell, tex) = coloured_rows(52, 8);
+    let (st, out) = call(ctx, KIND_MATH, &request((14, 30), (100, 60), cell.as_bytes(), tex.as_bytes()));
+    assert_eq!(st, OK, "{}", String::from_utf8_lossy(&out[..out.len().min(200)]));
+    let png = parse_response(&out).5;
+    assert!(png.len() > 64 * 1024 && png.len() <= MAX_PNG, "{}", png.len());
+    unsafe { jnv_close(ctx) };
+}
+
+/// mhchem (`\ce`, `\pu`) takes time that grows with the square of its
+/// argument and cannot be cancelled, so it is off: every way notebook text
+/// could reach it ends at once in a parse error (or, for a `\ce` the
+/// notebook defines itself, in that macro), within 100 ms even for the
+/// largest arguments a formula or a prelude can hold.
+#[test]
+fn chemistry_is_off_on_every_route() {
+    let _l = start();
+    let ctx = open(1);
+    let stars = "*".repeat(16_000);
+    let big = format!(r"\ce{{{stars}}}");
+    assert!(big.len() <= MAX_TEX);
+    let quotes = format!("$\\def\\a{{\\ce{{{}}}}}$", "\"".repeat(65_000));
+    assert!(quotes.len() <= MAX_PRELUDE);
+    let units = r"1.2e3 kg m//s ".repeat(1_100);
+    const NO: &str = r"math: parse: Undefined control sequence: \jnvnomhchem";
+    let cases: Vec<(&str, String, String, &str)> = vec![
+        // Plain use.
+        ("ce", String::new(), r"\ce{H2O}".into(), NO),
+        ("pu", String::new(), r"x = \pu{123 kJ/mol}".into(), NO),
+        ("ce, 16 KiB", String::new(), big.clone(), NO),
+        ("pu, 16 KiB", String::new(), format!(r"\pu{{{units}}}"), NO),
+        ("ce after a combining mark", String::new(), format!("\\ce\u{301}{{{stars}}}"), NO),
+        // Through a macro of the prelude or of the formula.
+        ("a prelude macro", r"$\def\w{\ce{H2O}}$".into(), r"\w".into(), NO),
+        ("a prelude macro, 64 KiB", quotes, r"\a".into(), NO),
+        ("a prelude newcommand", r"$\newcommand{\chem}[1]{\ce{#1}}$".into(), format!(r"\chem{{{stars}}}"), NO),
+        ("a formula macro", String::new(), format!(r"\def\c#1{{\ce{{#1}}}}\c{{{stars}}}"), NO),
+        ("an edef", String::new(), format!(r"\edef\c{{\ce}}\c{{{stars}}}"), NO),
+        // Aliases.
+        ("a formula alias", String::new(), format!(r"\let\c\ce \c{{{stars}}}"), NO),
+        ("a formula alias with =", String::new(), format!(r"\let\c=\ce \c{{{stars}}}"), NO),
+        ("a global alias", String::new(), format!(r"{{\global\let\c\ce}}\c{{{stars}}}"), NO),
+        ("a prelude alias", r"$\let\c\ce$".into(), format!(r"\c{{{stars}}}"), NO),
+        ("a prelude alias of pu", r"$\let\u=\pu$".into(), format!(r"\u{{{units}}}"), NO),
+        ("futurelet", String::new(), format!(r"\futurelet\c\relax\ce{{{stars}}}"), NO),
+        ("the alias target defined", r"$\def\jnvnomhchem#1{#1}$".into(), big.clone(), NO),
+        ("the alias target defined first", String::new(), format!(r"\def\jnvnomhchem#1{{#1}}{big}"), NO),
+        // Groups, environments and modes put the alias back when they close.
+        ("a group", String::new(), format!(r"{{{big}}}"), NO),
+        ("after a group", String::new(), format!(r"{{\let\ce\relax}}{big}"), NO),
+        ("after begingroup", String::new(), format!(r"\begingroup\let\ce\relax\endgroup{big}"), NO),
+        ("after an environment", String::new(), format!(r"\begin{{matrix}}\let\ce\relax\end{{matrix}}{big}"), NO),
+        ("in a table cell", String::new(), format!(r"\begin{{array}}{{cc}}x&{big}\end{{array}}"), NO),
+        ("in text", String::new(), format!(r"\text{{a {big}}}"), NO),
+        ("in an operator name", String::new(), format!(r"\operatorname{{{big}}}"), NO),
+        // Closing the outermost group early is an error of its own.
+        ("a stray close brace", String::new(), format!(r"}}{big}"), "math: parse: "),
+        ("a stray endgroup", String::new(), format!(r"\endgroup{big}"), "math: parse: "),
+        // No primitive builds the name from pieces.
+        ("csname", String::new(), format!(r"\csname ce\endcsname{{{stars}}}"), r"math: parse: Undefined control sequence: \csname"),
+        ("expandafter", String::new(), format!(r"\expandafter\ce{{{stars}}}"), r"math: parse: Undefined control sequence: \expandafter"),
+        // A \ce the notebook defines is its own macro.
+        ("a formula renewcommand", String::new(), r"\renewcommand{\ce}[1]{\mathrm{#1}}\ce{H_2O}".into(), "ok"),
+        ("a prelude def", r"$\def\ce#1{\mathrm{#1}}$".into(), r"\ce{H_2O}".into(), "ok"),
+        ("a prelude def, 16 KiB", r"$\def\ce#1{\mathrm{#1}}$".into(), big.clone(), "math: size: "),
+    ];
+    for (name, prelude, tex, want) in &cases {
+        let input = request((14, 30), (100, 60), prelude.as_bytes(), tex.as_bytes());
+        let t = Instant::now();
+        let (st, out) = call(ctx, KIND_MATH, &input);
+        let el = t.elapsed();
+        let msg = String::from_utf8_lossy(&out[..out.len().min(200)]).into_owned();
+        assert!(el < Duration::from_millis(100), "{name}: {el:?} {msg}");
+        if *want == "ok" {
+            assert_eq!(st, OK, "{name}: {msg}");
+        } else {
+            assert_eq!(st, ERR, "{name}: {msg}");
+            assert!(msg.starts_with(want), "{name}: wanted {want:?}, got {msg:?}");
+        }
     }
     unsafe { jnv_close(ctx) };
 }
@@ -355,6 +484,20 @@ fn hostile_inputs_end_quickly_and_never_panic() {
             ),
         ),
         ("a deep eqnarray".into(), req(&format!("{}x{}", r"\begin{eqnarray}".repeat(500), r"\end{eqnarray}".repeat(500)))),
+        ("16 KiB of \\ce".into(), req(&format!(r"\ce{{{}}}", "*".repeat(16_000)))),
+        ("16 KiB of \\pu".into(), req(&format!(r"\pu{{{}}}", r"1.2e3 kg m//s ".repeat(1_100)))),
+        (
+            "a 64 KiB \\ce through a prelude macro".into(),
+            request((14, 30), (100, 60), format!("$\\def\\a{{\\ce{{{}}}}}$", "\"".repeat(65_000)).as_bytes(), br"\a"),
+        ),
+        (
+            "an 8 KiB \\ce through a prelude macro, its alias in the formula".into(),
+            request((14, 30), (100, 60), format!("$\\def\\z{{\\ce{{{}}}}}$", "\"".repeat(8_000)).as_bytes(), br"\let\y\z \y 1"),
+        ),
+        ("dense colours past the PNG cap".into(), {
+            let (cell, tex) = coloured_rows(100, 49);
+            request((18, 40), (180, 60), cell.as_bytes(), tex.as_bytes())
+        }),
     ];
     for (name, input) in &cases {
         let t = Instant::now();

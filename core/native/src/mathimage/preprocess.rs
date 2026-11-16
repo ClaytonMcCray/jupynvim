@@ -1,7 +1,7 @@
 //! Before RaTeX: notebook TeX written for MathJax rewritten to forms RaTeX
 //! has ([`rewrite`]), and the macro definitions taken out of the notebook's
 //! markdown source ([`definitions`]), put in front of the formula
-//! ([`prepare`]).
+//! ([`prepare`]), after [`NO_CHEMISTRY`], which turns mhchem off.
 //!
 //! The scanner reads the bytes the way RaTeX's lexer splits them into
 //! tokens: a control word is a backslash and the longest run of ASCII
@@ -25,8 +25,38 @@
 
 use super::{MathErr, MAX_PRELUDE, MAX_TEX};
 
-/// The macro definitions of `prelude` in front of the rewritten `tex`.
-/// Too long is `Input`; nothing but blanks after the rewrite is `Empty`.
+/// The start of every prepared source: mhchem's `\ce` and `\pu` made
+/// aliases of a name nothing defines, so a chemistry formula fails at its
+/// first `\ce` or `\pu` with a parse error and shows as text.
+///
+/// RaTeX's mhchem parser takes time that grows with the square of its
+/// argument (seconds for a few kilobytes) and no flag stops it, so it must
+/// never see notebook text. Why nothing in the notebook can reach it:
+///
+/// - `\ce` and `\pu` are its only entry points, and RaTeX looks a name up
+///   in the definitions made during the parse before its built-in ones.
+/// - These two `\let`s are the parse's first tokens, read before anything
+///   from the notebook, in the parse's outermost group. Every group RaTeX
+///   opens is closed in the same order, so that outermost one, which alone
+///   could put the built-in `\ce` back, ends only with the parse; a group,
+///   an environment or a table cell restores these aliases when it closes.
+/// - Any later route ends at a lookup of the name: a macro whose body uses
+///   `\ce` (from the prelude or the formula), an alias made later with
+///   `\let` or `\futurelet` (it copies these aliases), `\global`, or the
+///   name inside `\text`. A redefinition (`\def`, `\renewcommand`) makes an
+///   ordinary macro of the notebook's own.
+/// - RaTeX has no `\csname` or `\expandafter` to build a name from pieces,
+///   a control word is only ASCII letters (a combining mark after `\ce` is
+///   a token of its own), and `\jnvnomhchem` reaches the parser marked as
+///   not expandable, so defining it does not help either.
+///
+/// The trailing blank ends the last control word, so the definitions or
+/// the formula that follow can start with letters.
+pub const NO_CHEMISTRY: &str = "\\let\\ce\\jnvnomhchem\\let\\pu\\jnvnomhchem ";
+
+/// [`NO_CHEMISTRY`], the macro definitions of `prelude`, then the
+/// rewritten `tex`. Too long is `Input`; nothing but blanks after the
+/// rewrite is `Empty`.
 pub fn prepare(prelude: &str, tex: &str) -> Result<String, MathErr> {
     if tex.len() > MAX_TEX {
         return Err(MathErr::Input(format!("the formula is {} bytes, at most {MAX_TEX}", tex.len())));
@@ -38,7 +68,10 @@ pub fn prepare(prelude: &str, tex: &str) -> Result<String, MathErr> {
     if body.trim().is_empty() {
         return Err(MathErr::Empty);
     }
-    let mut src = definitions(prelude);
+    let defs = definitions(prelude);
+    let mut src = String::with_capacity(NO_CHEMISTRY.len() + defs.len() + body.len());
+    src.push_str(NO_CHEMISTRY);
+    src.push_str(&defs);
     src.push_str(&body);
     Ok(src)
 }
@@ -188,7 +221,8 @@ impl Out {
 }
 
 /// A row of an `eqnarray` body: `[start, end)`, the separator after it
-/// ends at `sep_end`, and `amp` is its second `&` at brace depth 0.
+/// ends at `sep_end`, and `amp` is its own second `&` (outside braces and
+/// inner environments).
 struct Row {
     start: usize,
     end: usize,
@@ -481,12 +515,14 @@ impl Sc<'_> {
         None
     }
 
-    /// The rows of `[a, b)`: split at each `\\` at brace depth 0; the
-    /// separator keeps a `[..]` right after it.
+    /// The rows of `[a, b)`: split at each `\\` that is the eqnarray's own,
+    /// outside braces and outside any inner environment (`\begin` opens
+    /// one, `\end` closes it), so a nested matrix, array or cases keeps its
+    /// rows and columns; the separator keeps a `[..]` right after it.
     fn rows(&mut self, a: usize, b: usize) -> Option<Vec<Row>> {
         let s = self.s;
         let mut rows = Vec::new();
-        let mut depth = 0usize;
+        let (mut depth, mut envs) = (0usize, 0usize);
         let (mut start, mut amps, mut amp) = (a, 0u32, None);
         let mut j = a;
         while j < b {
@@ -499,7 +535,7 @@ impl Sc<'_> {
                     depth = depth.saturating_sub(1);
                     j + 1
                 }
-                b'&' if depth == 0 && plain_in(s, j, b'&') => {
+                b'&' if depth == 0 && envs == 0 && plain_in(s, j, b'&') => {
                     amps += 1;
                     if amps == 2 {
                         amp = Some(j);
@@ -508,18 +544,27 @@ impl Sc<'_> {
                 }
                 b'\\' => {
                     let e = self.tok_end(j, b);
-                    if depth == 0 && &s[j..e] == b"\\\\" {
-                        let mut sep = e;
-                        if self.plain(e, b, b'[') {
-                            if let Some(k) = self.bracket_end(e, b) {
-                                sep = k;
+                    match &s[j..e] {
+                        b"\\\\" if depth == 0 && envs == 0 => {
+                            let mut sep = e;
+                            if self.plain(e, b, b'[') {
+                                if let Some(k) = self.bracket_end(e, b) {
+                                    sep = k;
+                                }
                             }
+                            rows.push(Row { start, end: j, sep_end: sep, amp });
+                            (start, amps, amp) = (sep, 0, None);
+                            sep
                         }
-                        rows.push(Row { start, end: j, sep_end: sep, amp });
-                        (start, amps, amp) = (sep, 0, None);
-                        sep
-                    } else {
-                        e
+                        b"\\begin" => {
+                            envs += 1;
+                            e
+                        }
+                        b"\\end" => {
+                            envs = envs.saturating_sub(1);
+                            e
+                        }
+                        _ => e,
                     }
                 }
                 b'%' => self.line_end(j, b),
@@ -684,7 +729,8 @@ impl Sc<'_> {
     }
 
     /// `\begin{eqnarray}` ended at `body`: the body up to the first
-    /// `\end{eqnarray}` as `aligned`, the second `&` of each row deleted.
+    /// `\end{eqnarray}` as `aligned`, the second `&` of each of its own
+    /// rows deleted ([`Sc::rows`]; an inner environment is left whole).
     /// No end: `None` (copied as written).
     fn eqnarray(&mut self, body: usize, lim: usize, name: &[u8], defs: bool, nest: u32, out: &mut Out) -> Option<usize> {
         let s = self.s;
@@ -1022,6 +1068,35 @@ mod tests {
                 r"\begin{eqnarray}{a&b\\c}&=&x\&y&z\end{eqnarray}",
                 r"\begin{aligned}{a&b\\c}&=x\&y&z\end{aligned}",
             ),
+            // An inner environment keeps its rows and columns: only the
+            // eqnarray's own \\ and & count.
+            (
+                r"\begin{eqnarray} A &=& \begin{pmatrix} 1 & 2 & 3 \\ 4 & 5 & 6 \end{pmatrix} \\ b &=& c \end{eqnarray}",
+                r"\begin{aligned} A &= \begin{pmatrix} 1 & 2 & 3 \\ 4 & 5 & 6 \end{pmatrix} \\ b &= c \end{aligned}",
+            ),
+            (
+                r"\begin{eqnarray} f(x) &=& \begin{cases} 1 & x > 0 \\ 0 & x \le 0 \end{cases} \\ g &=& h \end{eqnarray}",
+                r"\begin{aligned} f(x) &= \begin{cases} 1 & x > 0 \\ 0 & x \le 0 \end{cases} \\ g &= h \end{aligned}",
+            ),
+            // On the left of the relation, and two environments deep.
+            (
+                r"\begin{eqnarray}\begin{matrix}a&b\\c&d\end{matrix}&=&e\end{eqnarray}",
+                r"\begin{aligned}\begin{matrix}a&b\\c&d\end{matrix}&=e\end{aligned}",
+            ),
+            (
+                r"\begin{eqnarray}x&=&\begin{array}{cc}\begin{pmatrix}1&2\\3&4\end{pmatrix}&y\\z&w\end{array}\\a&<&b\end{eqnarray}",
+                r"\begin{aligned}x&=\begin{array}{cc}\begin{pmatrix}1&2\\3&4\end{pmatrix}&y\\z&w\end{array}\\a&<b\end{aligned}",
+            ),
+            // After an inner environment closes, the eqnarray's own count again.
+            (
+                r"\begin{eqnarray}\begin {smallmatrix}1&2\end {smallmatrix}x&=&y&z\\u&v&w\end{eqnarray}",
+                r"\begin{aligned}\begin {smallmatrix}1&2\end {smallmatrix}x&=y&z\\u&vw\end{aligned}",
+            ),
+            // \begingroup is not an environment.
+            (
+                r"\begin{eqnarray}\begingroup a&=&b\endgroup\\c&=&d\end{eqnarray}",
+                r"\begin{aligned}\begingroup a&=b\endgroup\\c&=d\end{aligned}",
+            ),
             // The deleted & never joins a control word to letters.
             (r"\begin{eqnarray}a&\le&b\end{eqnarray}", r"\begin{aligned}a&\le b\end{aligned}"),
             (r"\begin{eqnarray}a\end{eqnarray}", r"\begin{aligned}a\end{aligned}"),
@@ -1173,8 +1248,14 @@ mod tests {
 
     #[test]
     fn prepare_joins_and_checks() {
-        assert_eq!(prepare("", "x").unwrap(), "x");
-        assert_eq!(prepare("\\newcommand{\\R}{r} prose", "\\R").unwrap(), "\\def\\R{r}\n\\R");
+        let nc = NO_CHEMISTRY;
+        assert_eq!(prepare("", "x").unwrap(), format!("{nc}x"));
+        assert_eq!(prepare("\\newcommand{\\R}{r} prose", "\\R").unwrap(), format!("{nc}\\def\\R{{r}}\n\\R"));
+        // The notebook's own \let, \def and \ce all come after it.
+        assert_eq!(
+            prepare("\\let\\ce\\relax \\def\\pu{p}", "\\ce{H2O}").unwrap(),
+            format!("{nc}\\let\\ce\\relax\n\\def\\pu{{p}}\n\\ce{{H2O}}")
+        );
         assert_eq!(prepare("", "  \n\t"), Err(MathErr::Empty));
         assert_eq!(prepare("", ""), Err(MathErr::Empty));
         assert_eq!(prepare("\\def\\a{b}", "\\label{x}"), Err(MathErr::Empty));
@@ -1202,6 +1283,8 @@ mod tests {
             "}".repeat(MAX_PRELUDE),
             format!("{}{}", r"\newcommand{\a}{".repeat(1000), "}".repeat(MAX_PRELUDE - 16_000)),
             r"\begin{eqnarray}a\\".repeat(MAX_PRELUDE / 19) + r"\end{eqnarray}",
+            format!(r"\begin{{eqnarray}}{}\end{{eqnarray}}", r"\begin{m}a&b\\".repeat(MAX_PRELUDE / 16)),
+            format!(r"\begin{{eqnarray}}{}\end{{eqnarray}}", r"\end{m}a&b\\".repeat(MAX_PRELUDE / 14)),
             r"\unicode[".repeat(MAX_PRELUDE / 9),
             r"\let\a=".repeat(MAX_PRELUDE / 7),
         ];
