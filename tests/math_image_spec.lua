@@ -13,17 +13,22 @@
 -- D  an edited block: one job, one transmit, one delete
 -- E  macros defined in an earlier cell
 -- F  what stays text: errors, missing glyphs, too wide, the text renderer,
---    another image renderer, and no library at all (a child Neovim)
+--    another image renderer, no library at all and a library from before
+--    the math kinds (child Neovims)
 -- G  images freed: a colour change, a deleted cell, a wiped buffer, and
 --    another notebook's wipe
 -- H  the markdown fixture notebook, and what its renders cost
--- I  :checkhealth jupynvim
+-- I  :checkhealth jupynvim, also before any notebook has rendered (a child
+--    Neovim on a pseudo-terminal that reports its size)
 -- J  a render never waits for a job
 -- K  the rows on the screen
+-- L  markdown cells that share one id
+-- M  chemistry (\ce, \pu) stays text
 --
 -- It needs libjupynvim and jupynvim-core, which section 1 of
 -- tests/run_all.sh builds (cd core && cargo build --release). A missing one
--- is a failure, never a skip. No kernel is started: none plays a part here.
+-- is a failure, never a skip; so is a missing python3, which section I uses
+-- to make a pseudo-terminal. No kernel is started: none plays a part here.
 -- Every wait is on a condition; the timings checked are budgets.
 
 local REPO = vim.fn.getcwd()
@@ -347,11 +352,14 @@ end
 local function lib_ready() vim.wait(10000, function() return st().lib == "ok" end, 10) return st().lib == "ok" end
 
 -- Render until the notebook's math has settled: no job pending, and a render
--- that submits, transmits and defers nothing.
+-- that submits, transmits and defers nothing. False once `ms` have passed.
+-- The deadline is on the monotonic clock, which moves also while the loop
+-- below never runs the event loop (vim.wait returns at once when nothing is
+-- pending, and libuv's cached time then stands still).
 local function settle(nb, win, ms)
-  local deadline = vim.uv.now() + (ms or 20000)
-  while vim.uv.now() < deadline do
-    vim.wait(math.max(1, deadline - vim.uv.now()), function() return pending() == 0 end, 5)
+  local deadline = vim.uv.hrtime() + (ms or 20000) * 1e6
+  while vim.uv.hrtime() < deadline do
+    vim.wait(math.max(1, math.floor((deadline - vim.uv.hrtime()) / 1e6)), function() return pending() == 0 end, 5)
     local s0 = stats()
     Render.refresh_sync(nb, win)
     local s1 = stats()
@@ -382,12 +390,14 @@ local function span(buf, nb, id)
 end
 local function is_ph(hl) return type(hl) == "string" and hl:sub(1, 11) == "JupynvimPH_" end
 -- What the marks of lines first..last show: the overlay rows that carry
--- placeholders, the virtual lines that carry them, and the marks of the
--- text rendering of math (inline virt_text in a math group).
+-- placeholders, the virtual lines that carry them, the marks of the text
+-- rendering of math (inline virt_text in a math group), and per line the
+-- number of marks that conceal it or draw over it.
 local function look(buf, ns, first, last)
-  local r = { ov = {}, vl = {}, text = 0, ph = {} }
+  local r = { ov = {}, vl = {}, text = 0, ph = {}, line = {} }
   for _, m in ipairs(vim.api.nvim_buf_get_extmarks(buf, ns, { first, 0 }, { last, -1 }, { details = true })) do
     local row, d = m[2], m[4]
+    if d.conceal ~= nil or d.virt_text_pos == "overlay" then r.line[row] = (r.line[row] or 0) + 1 end
     for _, ch in ipairs(d.virt_text or {}) do
       if is_ph(ch[2]) then
         r.ph[ch[2]] = true
@@ -420,9 +430,13 @@ local function text_only(v) return #v.ov == 0 and #v.vl == 0 and ph_count(v) == 
 -- Is the block on lines first..last drawn as image p: every row of it, with
 -- its highlight group, its width in cells, overlays where the block has
 -- lines and virtual lines under it for the rest (centred when it has more
--- lines than the image has rows)?
+-- lines than the image has rows), and each line's conceal and image row in
+-- one mark?
 local function placed(v, first, last, p)
   if not p then return false, "no placement" end
+  for row, n in pairs(v.line) do
+    if n > 1 then return false, ("line %d has %d marks that conceal it or draw over it"):format(row, n) end
+  end
   local hl = "JupynvimPH_" .. p.image_id
   local S, R = last - first + 1, p.rows
   for _, o in ipairs(v.ov) do
@@ -754,6 +768,103 @@ vim.cmd("qa!")
     and j.lib == "off" and j.native == "disabled", j and vim.inspect({ j.ph, j.text, j.lib, j.native }))
   chk("F6 and no warning or error says so", j ~= nil and #loud == 0 and not has(r.stderr, "Error")
     and not has(r.stderr, "E5108"), vim.inspect(loud) .. " " .. tostring(r.stderr))
+
+  -- a library from before the math kinds: a child Neovim in which the real
+  -- library answers as a 1.1 build would (ABI 1.1, no math kind)
+  local child11 = tmp .. "/child11.lua"
+  f = assert(io.open(child11, "w"))
+  f:write([==[
+-- opens one notebook with the library answering as ABI 1.1 without the math
+-- kinds, and prints, as one JSON line, what its math shows, what the
+-- palette and math sections of :checkhealth say, and every notice it made
+local repo, path = arg[1], arg[2]
+vim.opt.runtimepath:prepend(repo)
+package.path = repo .. "/lua/?.lua;" .. repo .. "/lua/?/init.lua;" .. package.path
+local ffi = require("ffi")
+local real_load = ffi.load
+ffi.load = function(p, ...)
+  local lib = real_load(p, ...)
+  if not tostring(p):find("libjupynvim", 1, true) then return lib end
+  return setmetatable({
+    jnv_abi_version = function() return 1 * 65536 + 1 end,
+    jnv_kind_supported = function(k)
+      if k == 2304 or k == 2305 then return 0 end
+      return lib.jnv_kind_supported(k)
+    end,
+  }, { __index = function(_, name) return lib[name] end })
+end
+local notes = {}
+vim.notify = function(m, l) notes[#notes + 1] = { msg = tostring(m), level = l or 0 } end
+local out = { notes = notes }
+local ok, err = pcall(function()
+  local J = require("jupynvim")
+  J.start_kernel = function() end
+  J.setup({ log_level = "warn", image_renderer = "placeholder", math = { cell_px = { w = 10, h = 20 } } })
+  local N = require("jupynvim.native")
+  local NB = require("jupynvim.notebook")
+  local buf = J.open(path)
+  vim.wait(10000, function() return buf ~= nil and NB.get(buf) ~= nil end, 10)
+  local nb = NB.get(buf)
+  local MI = require("jupynvim.notebook.mathimage")
+  vim.wait(10000, function() local l = MI.status().lib return l == "off" or l == "ok" end, 10)
+  require("jupynvim.notebook.render").refresh_sync(nb, vim.fn.bufwinid(buf))
+  local flushed = false
+  vim.schedule(function() flushed = true end)
+  vim.wait(5000, function() return flushed end, 5)
+  local ph, text = 0, 0
+  for _, m in ipairs(vim.api.nvim_buf_get_extmarks(buf, nb.border_ns, 0, -1, { details = true })) do
+    local d = m[4]
+    for _, ch in ipairs(d.virt_text or {}) do
+      if type(ch[2]) == "string" and ch[2]:sub(1, 11) == "JupynvimPH_" then ph = ph + 1 end
+      if d.virt_text_pos == "inline" and ch[2] == "JupynvimMdMathBlock" then text = text + 1 end
+    end
+    for _, vl in ipairs(d.virt_lines or {}) do
+      for _, ch in ipairs(vl) do
+        if type(ch[2]) == "string" and ch[2]:sub(1, 11) == "JupynvimPH_" then ph = ph + 1 end
+      end
+    end
+  end
+  out.ph, out.text = ph, text
+  out.lib = MI.status().lib
+  local ns = N.status()
+  out.native, out.abi, out.abi2 = ns.state, ns.abi, N.has_abi(2)
+  local lines = {}
+  local function rec(kind) return function(m) lines[#lines + 1] = kind .. " " .. tostring(m) end end
+  local H = require("jupynvim.health")
+  local h = { start = rec("START"), ok = rec("OK"), info = rec("INFO"), warn = rec("WARN"), error = rec("ERROR") }
+  H._palette(h)
+  H._math(h)
+  out.health = lines
+end)
+out.ok, out.err = ok, (not ok) and tostring(err) or nil
+io.stdout:write("\n", vim.json.encode(out), "\n")
+vim.cmd("qa!")
+]==])
+  f:close()
+  r = vim.system({ vim.v.progpath, "--headless", "-u", "NONE", "-l", child11, REPO, fpath }, { text = true }):wait(60000)
+  line = nil
+  for l in (r.stdout or ""):gmatch("[^\n]+") do if l:sub(1, 1) == "{" then line = l end end
+  okj, j = pcall(vim.json.decode, line or "")
+  if not okj or type(j) ~= "table" then j = nil end
+  loud = {}
+  for _, n in ipairs(j and j.notes or {}) do
+    if (tonumber(n.level) or 0) >= vim.log.levels.WARN then loud[#loud + 1] = n.msg end
+  end
+  local hl = j and type(j.health) == "table" and j.health or {}
+  local function hline(prefix, sub)
+    for _, l in ipairs(hl) do if l:sub(1, #prefix) == prefix and has(l, sub) then return l end end
+  end
+  chk("F7 a library at ABI 1.1 without the math kinds loads: ok, ABI 1.1, has_abi(2) false",
+    j ~= nil and j.ok == true and j.native == "ok" and j.abi == "1.1" and j.abi2 == false,
+    j and vim.inspect({ j.err, j.native, j.abi, j.abi2 }) or ("exit %s, stderr %s"):format(r.code, r.stderr))
+  chk("F7 every block is text, no placeholder, the module's library off", j ~= nil and j.ph == 0 and j.text >= 3
+    and j.lib == "off", j and vim.inspect({ j.ph, j.text, j.lib }))
+  chk("F7 the palette still derives (OK palette: ...)", hline("OK ", "palette: ") ~= nil, vim.inspect(hl))
+  chk("F7 the math section says why, as information: this libjupynvim (ABI 1.1)",
+    hline("INFO ", "this libjupynvim (ABI 1.1)") ~= nil and hline("WARN ", "") == nil and hline("ERROR ", "") == nil,
+    vim.inspect(hl))
+  chk("F7 and no notice warns", j ~= nil and #loud == 0 and not has(r.stderr, "Error") and not has(r.stderr, "E5108"),
+    vim.inspect(loud) .. " " .. tostring(r.stderr))
 end)
 
 -- ── G. lifetime ──────────────────────────────────────────────────────────
@@ -912,6 +1023,94 @@ run("I. :checkhealth jupynvim", function()
   chk("I3 OK typeset probe: <cols>x<rows> cells in <ms>", is_ok(l2) and l2:find("typeset probe: %d+x%d+ cells in ") ~= nil,
     l2 or part)
   chk("I4 nothing in the section warns", part ~= "" and not has(part, "WARNING") and not has(part, "ERROR"), part)
+
+  -- Before any notebook has rendered, the module has not asked for the
+  -- library nor measured the cell: the section asks the terminal itself. A
+  -- child Neovim whose stderr is a pseudo-terminal of 180x50 cells and
+  -- 2520x1500 pixels (14x30 a cell), with no math.cell_px.
+  local hchild = tmp .. "/health_child.lua"
+  local f = assert(io.open(hchild, "w"))
+  f:write([==[
+-- the math section of :checkhealth before any notebook has rendered, then
+-- with the module's library answer "off", as one JSON line
+local repo = arg[1]
+vim.opt.runtimepath:prepend(repo)
+package.path = repo .. "/lua/?.lua;" .. repo .. "/lua/?/init.lua;" .. package.path
+vim.env.TERM = "xterm-kitty"
+vim.notify = function() end
+local out = {}
+local ok, err = pcall(function()
+  local J = require("jupynvim")
+  J.setup({ log_level = "warn", image_renderer = "placeholder" })
+  local N = require("jupynvim.native")
+  out.up = N.available()
+  local MI = require("jupynvim.notebook.mathimage")
+  local H = require("jupynvim.health")
+  local function section()
+    local lines = {}
+    local function rec(kind) return function(m) lines[#lines + 1] = kind .. " " .. tostring(m) end end
+    H._math({ start = rec("START"), ok = rec("OK"), info = rec("INFO"), warn = rec("WARN"), error = rec("ERROR") })
+    return lines
+  end
+  out.lib_before = MI.status().lib
+  out.first = section()
+  out.lib_after = MI.status().lib
+  MI._S.lib = "off"
+  local st = MI.status()
+  out.active, out.why, out.lib_off = st.active, st.why, st.lib
+  out.second = section()
+end)
+out.ok, out.err = ok, (not ok) and tostring(err) or nil
+io.stdout:write("\n", vim.json.encode(out), "\n")
+vim.cmd("qa!")
+]==])
+  f:close()
+  -- stdin from /dev/null, stdout a pipe, stderr the pseudo-terminal, whose
+  -- other end is drained so nothing written there can block the child
+  local PTY = [[
+import fcntl, os, pty, struct, subprocess, sys, termios, threading
+m, s = pty.openpty()
+fcntl.ioctl(s, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 180, 2520, 1500))
+def drain():
+    try:
+        while os.read(m, 4096):
+            pass
+    except OSError:
+        pass
+threading.Thread(target=drain, daemon=True).start()
+p = subprocess.run(sys.argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=s, timeout=60)
+sys.stdout.buffer.write(p.stdout)
+sys.exit(p.returncode)
+]]
+  local py = vim.fn.exepath("python3")
+  chk("I5 python3 is there to make a pseudo-terminal", py ~= "", "python3 not found in PATH")
+  if py == "" then return end
+  local r = vim.system({ py, "-I", "-c", PTY, vim.v.progpath, "--headless", "-u", "NONE", "-l", hchild, REPO },
+    { text = true }):wait(90000)
+  local jl
+  for l in (r.stdout or ""):gmatch("[^\n]+") do if l:sub(1, 1) == "{" then jl = l end end
+  local okj, j = pcall(vim.json.decode, jl or "")
+  if not okj or type(j) ~= "table" then j = nil end
+  local function hline(list, prefix, sub)
+    for _, l in ipairs(type(list) == "table" and list or {}) do
+      if l:sub(1, #prefix) == prefix and has(l, sub) then return l end
+    end
+  end
+  chk("I5 the child runs the section", j ~= nil and j.ok == true and j.up == true,
+    j and vim.inspect(j) or ("exit %s, stderr %s"):format(r.code, r.stderr))
+  local first = j and j.first or {}
+  chk("I5 before any notebook has rendered: OK cell 14x30 px, from the terminal (asked by the section)",
+    hline(first, "OK ", "cell 14x30 px, from the terminal") ~= nil and hline(first, "WARN ", "") == nil,
+    vim.inspect(first))
+  chk("I5 and it says the module has not asked for the library yet, and leaves it so",
+    hline(first, "INFO ", "none has rendered yet") ~= nil and j.lib_before == "unasked" and j.lib_after == "unasked",
+    j and vim.inspect({ j.lib_before, j.lib_after, first }))
+  local second = j and j.second or {}
+  local said = j and j.active == false and type(j.why) == "string" and j.why ~= ""
+    and (hline(second, "INFO ", j.why) ~= nil
+      or (j.lib_off == "unasked" and hline(second, "INFO ", "none has rendered yet") ~= nil))
+  chk("I6 images off for the module's own reason: the section prints that reason", said == true,
+    j and vim.inspect({ j.active, j.why, second }))
 end)
 
 -- ── J. the UI thread ─────────────────────────────────────────────────────
@@ -997,6 +1196,100 @@ run("K. the rows on the screen", function()
     bottom ~= nil and has(text_of[bottom - 1] or "", "│ 1 ") and kind[bottom + 1] == "blank",
     bottom and ("%q / %q / %q"):format(text_of[bottom - 1] or "", text_of[bottom] or "", text_of[bottom + 1] or "")
       or vim.inspect(text_of))
+  close(buf)
+end)
+
+-- ── L. cells that share an id ────────────────────────────────────────────
+-- A notebook in which markdown cells repeat one id (invalid since nbformat
+-- 4.5, but copies and hand merges make them): each cell still gets images of
+-- its own, the notebook settles, and an idle editor then renders nothing.
+-- The same notebook with distinct ids is the control for the idle check.
+run("L. markdown cells that share one id", function()
+  vim.cmd("silent! only")
+  local function twenty(id_of)
+    local cells = {}
+    for i = 1, 20 do cells[i] = md(id_of(i), ("$$x^{%d}$$"):format(i)) end
+    return cells
+  end
+  -- every cell's block an image, each in a group of its own; the number of
+  -- images, and whether every cell has one
+  local function own_images(buf, nb)
+    local ranges = CellMode.ranges(buf)
+    local groups, n, all = {}, 0, true
+    for i = 1, #nb.cells do
+      local r = ranges[i]
+      local v = r and look(buf, nb.border_ns, r.start, r.stop - 1)
+      local hl = v and next(v.ph)
+      if not v or ph_count(v) ~= 1 or #v.ov == 0 then
+        all = false
+      elseif not groups[hl] then
+        groups[hl], n = true, n + 1
+      end
+    end
+    return n, all
+  end
+  -- a second left idle: renders, jobs, transmits and terminal writes in it,
+  -- once what the last render scheduled has run
+  local function idle()
+    vim.wait(300, function() return false end, 10)
+    reset_ui()
+    local s0, r0 = stats(), Render._render_n or 0
+    vim.wait(1000, function() return false end, 10)
+    local s1 = stats()
+    return { renders = (Render._render_n or 0) - r0, submits = s1.submits - s0.submits,
+             transmits = s1.transmits - s0.transmits, writes = #writes() }
+  end
+  local function quiet(t) return t.renders == 0 and t.submits == 0 and t.transmits == 0 and t.writes == 0 end
+
+  local buf, nb, win = open(write_nb("ids_distinct", twenty(function(i) return "d" .. i end)))
+  chk("L0 control: 20 cells with distinct ids settle", nb ~= nil and settle(nb, win, 20000), vim.inspect(st()))
+  local n, all = own_images(buf, nb)
+  chk(("L0 control: 20 images of their own (%d)"):format(n), n == 20 and all)
+  local t = idle()
+  chk("L0 control: idle for a second, nothing renders", quiet(t), vim.inspect(t))
+  close(buf)
+
+  buf, nb, win = open(write_nb("ids_same", twenty(function() return "same-id" end)))
+  chk("L1 20 cells with one id open", nb ~= nil and #nb.cells == 20, nb and #nb.cells)
+  if not nb then return end
+  chk("L1 they settle within 10 s", settle(nb, win, 10000), vim.inspect(st()))
+  n, all = own_images(buf, nb)
+  chk(("L2 every block is an image of its own: 20 images, 20 groups (%d, %d slots)"):format(n, math_slots(buf)),
+    n == 20 and all and math_slots(buf) == 20)
+  t = idle()
+  chk("L3 left idle for a second: no render, no job, no transmit, nothing written", quiet(t), vim.inspect(t))
+  close(buf)
+end)
+
+-- ── M. chemistry ─────────────────────────────────────────────────────────
+-- \ce and \pu (mhchem) are turned off: a formula that uses them fails to
+-- parse and stays text, whether it uses them directly, through a macro
+-- from an earlier cell or through an alias made with \let.
+run("M. chemistry stays text", function()
+  vim.cmd("silent! only")
+  for _, tex in ipairs({ "\\ce{H2O}", "\\pu{123 kJ}" }) do
+    local okc, msg = N.call(N.KIND.MATH, request(tex))
+    chk(("M1 %s through the library: math: parse: ..."):format(tex),
+      not okc and type(msg) == "string" and msg:find("math: parse: ", 1, true) == 1, tostring(msg):sub(1, 200))
+  end
+  local f0 = stats().fails
+  local buf, nb, win = open(write_nb("chemistry", {
+    md("m1", "$$\\ce{H2O}$$"),
+    md("m2", "$$\\pu{123 kJ/mol}$$"),
+    md("m3", "Water: $\\def\\water{\\ce{H_2O}}$ and $\\let\\chem\\ce$"),
+    md("m4", "$$\\water + x$$"),
+    md("m5", "$$\\chem{CO2}$$"),
+    md("m6", "$$x^2 + 1$$"),
+  }))
+  chk("M2 the notebook settles", nb ~= nil and settle(nb, win, 20000), vim.inspect(st()))
+  if not nb then return end
+  for _, c in ipairs({ { "m1", "\\ce" }, { "m2", "\\pu" }, { "m4", "a macro holding \\ce" },
+                       { "m5", "an alias of \\ce made with \\let" } }) do
+    chk(("M2 %s stays text"):format(c[2]), text_only(view(buf, nb, c[1])) and placement(buf, c[1]) == nil)
+  end
+  chk("M2 and each counts as a failure", stats().fails - f0 >= 4, stats().fails - f0)
+  local v6, a6, b6 = view(buf, nb, "m6")
+  chk("M3 a formula next to them without chemistry is an image", placed(v6, a6, b6, placement(buf, "m6")))
   close(buf)
 end)
 
