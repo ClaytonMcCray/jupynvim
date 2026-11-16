@@ -24,6 +24,8 @@
 -- K  the rows on the screen
 -- L  markdown cells that share one id
 -- M  chemistry (\ce, \pu) stays text
+-- N  a notebook of hundreds of formulas fills in by itself, with the
+--    renders the module asks for spaced by what a render costs
 --
 -- It needs libjupynvim and jupynvim-core, which section 1 of
 -- tests/run_all.sh builds (cd core && cargo build --release). A missing one
@@ -1290,6 +1292,67 @@ run("M. chemistry stays text", function()
   chk("M2 and each counts as a failure", stats().fails - f0 >= 4, stats().fails - f0)
   local v6, a6, b6 = view(buf, nb, "m6")
   chk("M3 a formula next to them without chemistry is an image", placed(v6, a6, b6, placement(buf, "m6")))
+  close(buf)
+end)
+
+-- ── N. a notebook of hundreds of formulas ────────────────────────────────
+-- It fills in by itself, and the renders the module asks for while its
+-- jobs come in are spaced: each starts at least three times the length of
+-- the render before it after that one began (30 ms at least, a second at
+-- most), so the main loop is free between them however long a render of
+-- the notebook takes. The notebook opens with math as text and settles
+-- first, so that every render after the switch to images is one the
+-- module asked for.
+run("N. a notebook of hundreds of formulas", function()
+  vim.cmd("silent! only")
+  local NBL = 700
+  local cells = {}
+  for i = 1, NBL do cells[i] = md("n" .. i, ("$$y_{%d} + \\frac{%d}{k}$$"):format(i, i)) end
+  vim.cmd("JupynvimMathMode text")
+  local buf, nb, win = open(write_nb("many", cells))
+  chk("N0 the notebook opens", nb ~= nil and #nb.cells == NBL)
+  if not nb then return end
+  vim.wait(1500, function() return false end, 10)
+  local log = {}
+  local rb, rf, t_b = MI.begin, MI.finish, nil
+  MI.begin = function(...) t_b = vim.uv.hrtime() / 1e6; return rb(...) end
+  MI.finish = function(rctx, ...)
+    local r = rf(rctx, ...)
+    if t_b and rctx and rctx.buf == buf then log[#log + 1] = { t = t_b, d = vim.uv.hrtime() / 1e6 - t_b } end
+    t_b = nil
+    return r
+  end
+  local ok, err = pcall(function()
+    local function images()
+      local n = 0
+      for i = 1, NBL do if placement(buf, "n" .. i) then n = n + 1 end end
+      return n
+    end
+    vim.cmd("JupynvimMathMode auto")                   -- one render of the notebook, then it is on its own
+    local t0 = vim.uv.hrtime()
+    local done_ = vim.wait(30000, function() return images() == NBL and pending() == 0 end, 10)
+    local secs = (vim.uv.hrtime() - t0) / 1e9
+    chk(("N1 every formula is an image, with no render asked from outside (%d renders, %.2f s)"):format(#log, secs),
+      done_ and images() == NBL, ("%d of %d"):format(images(), NBL))
+    chk(("N2 the jobs, at most 256 at once, take a few renders, not one per formula (%d)"):format(#log),
+      #log >= 3 and #log <= 12)
+    local worst, close_ = math.huge, nil
+    for i = 2, #log do
+      local want = math.min(1000, math.max(30, 3 * log[i - 1].d))
+      local got = log[i].t - log[i - 1].t
+      if got - want < worst then worst, close_ = got - want, ("render %d: %.1f ms after one of %.1f ms"):format(i, got, log[i - 1].d) end
+    end
+    chk("N3 each render the module asked for began at least 3 x the one before after it (30 ms to 1 s)",
+      #log >= 2 and worst >= -3, close_)
+    vim.wait(300, function() return false end, 10)
+    local n0 = #log
+    reset_ui()
+    vim.wait(1000, function() return false end, 10)
+    chk("N4 then, left idle for a second: no render, nothing written", #log == n0 and #writes() == 0,
+      ("%d renders, %d writes"):format(#log - n0, #writes()))
+  end)
+  MI.begin, MI.finish = rb, rf
+  chk("N ran to its end", ok, err)
   close(buf)
 end)
 
