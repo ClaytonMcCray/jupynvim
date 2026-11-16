@@ -990,13 +990,20 @@ change to them reaches the cells below once you leave the cell's edit mode.
 A `%` anywhere in a markdown cell starts a TeX comment as far as definitions
 go, also in prose: a definition after it on the same line is not seen
 (`Growth was 50% faster. $\newcommand{\R}{\mathbb{R}}$` defines nothing), so
-put definitions on a line of their own. A formula whose source line is wider
-than the window is drawn above that line, and the line's wrapped rows stay
-as blank rows under the image. A notebook opens with its math as text, and
-each formula turns into an image as its job finishes. Every display formula
-of an open notebook is typeset, also the ones off screen, and the sizes are
-capped: an image is at most 1 MiB, and the images kept for all notebooks at
-most 64 MiB. A formula past either cap shows as text.
+put definitions on a line of their own. Macros come from at most the first
+64 markdown cells that define any (a cell counts once it contains
+`\newcommand`, `\def\` or the like, even in prose) and from at most 64 KiB of
+them; from the first defining cell past either limit down, display math
+shows as text rather than with a macro missing or an older meaning. A
+formula whose source line is wider than the window is drawn above that line,
+and the line's wrapped rows stay as blank rows under the image. A notebook
+opens with its math as text, and each formula turns into an image as its job
+finishes. Every display formula of an open notebook is typeset, also the
+ones off screen, and the sizes are capped: an image is at most 1 MiB, and
+the images kept at most 64 MiB, shared by all open notebooks and taken first
+come, first served. A formula past either cap shows as text. A formula that
+takes more than 10 s to typeset stops holding up the ones after it; it shows
+when it is done, and stays text if it never finishes.
 
 The image's size comes from the size of a terminal cell in pixels, which
 jupynvim asks the terminal for. Inside tmux, over a remote UI, or in a
