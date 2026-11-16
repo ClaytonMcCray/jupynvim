@@ -1002,8 +1002,10 @@ finishes. Every display formula of an open notebook is typeset, also the
 ones off screen, and the sizes are capped: an image is at most 1 MiB, and
 the images kept at most 64 MiB, shared by all open notebooks and taken first
 come, first served. A formula past either cap shows as text. A formula that
-takes more than 10 s to typeset stops holding up the ones after it; it shows
-when it is done, and stays text if it never finishes.
+is not typeset within 10 s is cancelled so it stops holding up the ones after
+it, and asked for again; one that keeps taking that long stays text after its
+third try, until the colors, cell size or scale change. An answer that still
+comes in late is shown.
 
 The image's size comes from the size of a terminal cell in pixels, which
 jupynvim asks the terminal for. Inside tmux, over a remote UI, or in a

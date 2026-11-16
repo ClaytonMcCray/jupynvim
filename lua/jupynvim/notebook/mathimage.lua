@@ -19,7 +19,9 @@
 --
 -- Whatever a notebook holds, what it can cost is bounded: at most
 -- MAX_INFLIGHT jobs at once (one in flight past JOB_MS is cancelled and
--- gives its slot back, though its answer is still taken if it comes); per
+-- gives its slot back, though its answer is still taken if it comes); at
+-- most MAX_STALLS jobs for one formula at one width that are cancelled that
+-- way while they were running, after which it is text for good; per
 -- render at most render_bytes of base64 sent (one transmit always goes, so
 -- a notebook settles); an image of at most image_b64 bytes, and cache_bytes
 -- of base64 cached across every notebook; the macro prelude from at most
@@ -48,6 +50,10 @@ local CACHE_MAX = 1024         -- formula records kept before the oldest are dro
 local FIT_MAX = 4              -- widths a formula that had to shrink keeps results for
 local JOB_MS = 10000           -- a job in flight longer than this is cancelled
 local WATCH_MS = 1000          -- begin looks for such jobs at most this often
+local MAX_STALLS = 3           -- such jobs, running, that answer CANCELLED before a width is given up
+local TIMED_OUT = "math: internal: timed out"
+-- the library's lanes, in the order its workers take jobs from them
+local LANE = { visible = 0, normal = 1, background = 2 }
 -- the renders the module asks for itself: one per buffer per GAP_X times
 -- the buffer's last render, never closer than GAP_MIN nor further than GAP_MAX
 local GAP_MIN, GAP_MAX, GAP_X = 30, 1000, 3
@@ -59,12 +65,15 @@ M._limits = {
   render_bytes = 2 * 1048576,              -- base64 transmitted by one render
 }
 
--- timeouts: jobs that went past JOB_MS; late: of those, the ones whose
--- result came all the same; prelude_cut: blocks shown as text because a
--- macro-defining cell at or above theirs was left out of the prelude
+-- Every answer counts once: in done, fails or cancels (a CANCELLED answer
+-- that is asked for again). timeouts: jobs that went past JOB_MS; late: of
+-- those, the ones whose result came all the same; gave_up: failures that
+-- are the MAX_STALLS-th CANCELLED answer of such a job that was running,
+-- for one formula at one width; prelude_cut: blocks shown as text because
+-- a macro-defining cell at or above theirs was left out of the prelude
 M.stats = { blocks = 0, hits = 0, submits = 0, done = 0, fails = 0, cancels = 0,
             transmits = 0, deferred = 0, timeouts = 0, late = 0, budget = 0, evict_scans = 0,
-            prelude_cut = 0 }
+            prelude_cut = 0, gave_up = 0 }
 
 -- Seams for the tests.
 M._native = nil                -- a stand-in for require("jupynvim.native")
@@ -84,6 +93,8 @@ local ALIGNS = { left = true, center = true }
 --     fit = { [avail] = R | { pending = id, users = { [buf] = tick } }
 --                         | { err = msg, budget = bool } },
 --     fit_order = { avail, ... }, waiters = { [buf] = true },
+--     stalled = { [avail] = <jobs at that width that went past JOB_MS while
+--                            running and then answered CANCELLED> } | nil,
 --     bytes = <base64 bytes of its results>, pre = prelude, tex = tex }
 -- users[buf] is the tick of the last render of that buffer that showed F or
 -- asked for it; F is in use while that is the buffer's latest render
@@ -112,9 +123,11 @@ local S = {
   n = 0,                           -- number of F records
   bytes = 0,                       -- base64 bytes of every R in the cache
   dry = nil,                       -- { n, bytes, tick } of an eviction scan that left it over
-  -- job id -> { F, avail, mark = F.fit[avail], cw, ch, tex, t0, overdue }.
-  -- An overdue job was cancelled after JOB_MS and gave its slot back; it
-  -- stays here, and its mark stays pending, until its answer comes.
+  -- job id -> { F, avail, mark = F.fit[avail], cw, ch, tex, t0, lane, overdue, ran }.
+  -- lane: the pool's lane (LANE). An overdue job was cancelled after JOB_MS
+  -- and gave its slot back; it stays here, and its mark stays pending,
+  -- until its answer comes. ran: it was most likely running, not waiting,
+  -- when it went overdue (see watchdog).
   jobs = {},
   inflight = 0,                    -- jobs that hold a slot: those not overdue
   starved = {},                    -- buf -> true: wanted a job while every slot was taken
@@ -787,10 +800,22 @@ local function parse_response(out, j)
            used = S.tick, users = {} }
 end
 
+-- Has F been given up at width avail: has a job there gone overdue while
+-- running and answered CANCELLED MAX_STALLS times? (For this variant: the
+-- count goes with the record.)
+local function gave_up(F, avail)
+  return F.stalled ~= nil and (F.stalled[avail] or 0) >= MAX_STALLS
+end
+
 -- A job's answer. An overdue job (see watchdog) is answered like any other:
--- a result that comes late is kept and shown, CANCELLED means it never ran
--- (a later render asks again), an error is an error. Its slot was given
--- back when it went overdue, so it frees none now.
+-- a result that comes late is kept and shown, an error is an error, and
+-- CANCELLED means it did not finish: a later render asks again. But the
+-- MAX_STALLS-th time a job for this formula at this width went overdue
+-- while it was running and answered so, the width fails for good: a
+-- formula slower than JOB_MS does not take a worker again and again. A
+-- job that was only waiting in the queue is asked for again uncounted;
+-- after a counted one the next job goes first (see submit).
+-- Its slot was given back when it went overdue, so it frees none now.
 local function done(id, ok, out, status)
   local j = S.jobs[id]
   if not j then return end      -- dropped: another variant, reset or wipe
@@ -824,8 +849,20 @@ local function done(id, ok, out, status)
       log.debug(("math image: %s (%s)"):format(Image.log_text(F.err, 200), j.tex))
     end
   elseif cancelled ~= nil and status == cancelled then
-    drop_fit(F, j.avail)        -- a later render asks again
-    M.stats.cancels = M.stats.cancels + 1
+    if j.overdue and j.ran then
+      F.stalled = F.stalled or {}
+      F.stalled[j.avail] = (F.stalled[j.avail] or 0) + 1
+    end
+    if gave_up(F, j.avail) then
+      F.fit[j.avail] = { err = TIMED_OUT }   -- final for this variant (see gave_up)
+      M.stats.gave_up = M.stats.gave_up + 1
+      M.stats.fails = M.stats.fails + 1
+      log.debug(("math image: %s, cancelled %d times past %d ms (%s)"):format(
+        TIMED_OUT, F.stalled[j.avail], JOB_MS, j.tex))
+    else
+      drop_fit(F, j.avail)      -- a later render asks again
+      M.stats.cancels = M.stats.cancels + 1
+    end
   else
     local msg = tostring(out)
     -- the class, from the library's message (not notebook text)
@@ -858,10 +895,17 @@ local function submit(F, tex, prelude, avail, rctx, spec)
     rctx.fg, cw, ch, tostring(S.cfg.scale), avail, MAX_ROWS, #prelude, #tex)
     .. prelude .. tex
   local visible = rctx.top ~= nil and spec.last >= rctx.top - 50 and spec.first <= rctx.bot + 50
+  -- Once a job here was cancelled while running (a stall), the formula's
+  -- next jobs here are taken first, as a visible block's are. A job may be
+  -- running when JOB_MS from its submit runs out because it waited in the
+  -- queue nearly that long, not because the formula is slow; a next try
+  -- that starts at once times the formula and not the queue.
+  local stalled = F.stalled ~= nil and (F.stalled[avail] or 0) > 0
+  local prio = (visible or stalled) and "visible" or "normal"
   -- declared first: the callback closes over it (it runs from the pump on
   -- the main loop, never before submit returns)
   local id, why
-  local okc, r1, r2 = pcall(N.submit, N.KIND.MATH, req, { priority = visible and "visible" or "normal" },
+  local okc, r1, r2 = pcall(N.submit, N.KIND.MATH, req, { priority = prio },
     function(ok, out, status) done(id, ok, out, status) end)
   if okc then id, why = r1, r2 else why = r1 end
   if not id then
@@ -874,9 +918,34 @@ local function submit(F, tex, prelude, avail, rctx, spec)
   trim_fit(F)
   account(F)
   S.jobs[id] = { F = F, avail = avail, mark = mark, cw = cw, ch = ch, tex = Image.log_text(tex),
-                 t0 = M._now(), overdue = false }
+                 t0 = M._now(), lane = LANE[prio], overdue = false, ran = false }
   S.inflight = S.inflight + 1
   M.stats.submits = M.stats.submits + 1
+end
+
+-- The library's worker count: how many jobs run at once (1 when it does
+-- not say).
+local function workers(N)
+  local ok, st = pcall(function() return N.status and N.status() end)
+  local w = ok and type(st) == "table" and tonumber(st.workers) or nil
+  if not (w and w > 0 and w < math.huge) then return 1 end
+  return w
+end
+
+-- job id -> how many unanswered jobs the library runs before it: those
+-- of a lane taken first, and those of its own lane with a lower id (its
+-- workers take each lane in submit order). An overdue job whose answer has
+-- not come counts too: it may still hold a worker.
+local function ahead_counts()
+  local list = {}
+  for id, j in pairs(S.jobs) do list[#list + 1] = { id, j.lane or LANE.normal } end
+  table.sort(list, function(a, b)
+    if a[2] ~= b[2] then return a[2] < b[2] end
+    return a[1] < b[1]
+  end)
+  local ahead = {}
+  for i, e in ipairs(list) do ahead[e[1]] = i - 1 end
+  return ahead
 end
 
 -- A job in flight for longer than JOB_MS goes overdue: it is cancelled
@@ -884,27 +953,40 @@ end
 -- that never answers cannot hold a slot for good. It judges nothing: the
 -- job stays in S.jobs and its formula stays pending (text, not asked for
 -- again) until its answer decides (see done); a wait of the main loop or of
--- the library's queue costs no formula its image. Looked for from begin, at
--- most once per WATCH_MS. The notebooks that waited for a slot render
--- again (but `except`, the one being rendered).
+-- the library's queue costs no formula its image. It notes whether the job
+-- was most likely running then (fewer jobs ahead of it than the library
+-- has workers) rather than waiting: only a running job's CANCELLED answer
+-- counts towards giving its formula up. Looked for from begin, at most
+-- once per WATCH_MS. The notebooks that waited for a slot render again
+-- (but `except`, the one being rendered).
 local function watchdog(except)
   if S.inflight <= 0 then return end
   local now = M._now()
   if S.watch_at and now - S.watch_at < WATCH_MS then return end
   S.watch_at = now
-  local N, any = nil, false
+  local late
   for id, j in pairs(S.jobs) do
     if not j.overdue and now - j.t0 > JOB_MS then
-      N = N or native()
-      pcall(N.cancel, id)
+      late = late or {}
+      late[#late + 1] = id
+    end
+  end
+  if not late then return end
+  local N = native()
+  local w, ahead = workers(N), ahead_counts()
+  for _, id in ipairs(late) do
+    local j = S.jobs[id]
+    if j and not j.overdue then
+      j.ran = ahead[id] < w
       j.overdue = true
       S.inflight = S.inflight - 1
       M.stats.timeouts = M.stats.timeouts + 1
-      log.debug(("math image: a job in flight for %d ms is cancelled (%s)"):format(math.floor(now - j.t0), j.tex))
-      any = true
+      pcall(N.cancel, id)
+      log.debug(("math image: a job in flight for %d ms is cancelled, %s (%s)"):format(
+        math.floor(now - j.t0), j.ran and "running" or "waiting", j.tex))
     end
   end
-  if any then slots_freed(except) end
+  slots_freed(except)
 end
 
 -- ── one block ───────────────────────────────────────────────────────────
@@ -961,7 +1043,10 @@ local function math_block(cctx, tex, spec)
     R = F.nat                                          -- the natural size fits this width
   else
     local f = F.fit[avail]
-    if f == nil then
+    if f == nil and gave_up(F, avail) then
+      free_slot(B, key)                                -- given up here (its mark trimmed since)
+      return nil
+    elseif f == nil then
       submit(F, tex, prelude, avail, rctx, { first = first, last = last })
       if F.err then free_slot(B, key); return nil end
       local g = F.fit[avail]

@@ -19,7 +19,9 @@
 --    (spaced by what a render costs, and coalesced), a new ink waking the
 --    notebooks that waited on dropped jobs, the byte budget counted by the
 --    results windows show, a buffer wiped without autocommands, macros
---    past the 64th defining cell, and a width that is not a number.
+--    past the 64th defining cell, a width that is not a number, a formula
+--    whose job is cancelled while running past 10 s a third time (text for
+--    good), and which jobs past 10 s count as running rather than waiting.
 -- C  setup(): every bad value falls back to its default with one warning.
 --
 -- The terminal UI is simulated as in stream_writer_spec.lua: nvim_list_uis
@@ -222,8 +224,9 @@ local function new_fake(o)
     cell_answer = o.cell_answer == nil and CELL_14x30 or o.cell_answer,
     supported = o.supported or 1,
     ready = o.ready == nil and true or o.ready,   -- true, false, or "never" (still loading)
+    workers = o.workers,                          -- what status() reports (nil: not said)
   }
-  function F.status() return { state = F.ready == true and "ok" or "unloaded" } end
+  function F.status() return { state = F.ready == true and "ok" or "unloaded", workers = F.workers } end
   function F.when_ready(cb)
     F.asked = F.asked + 1
     if F.ready == "never" then F.waiting = cb; return end
@@ -1134,6 +1137,13 @@ local function jobs_for(tex)
   for _, j in ipairs(fake.jobs) do if j.data:sub(-(#tex + 2)) == "\n\n" .. tex then n = n + 1 end end
   return n
 end
+-- the newest job asked for a formula
+local function job_of(tex)
+  for k = #fake.jobs, 1, -1 do
+    local j = fake.jobs[k]
+    if j.data:sub(-(#tex + 2)) == "\n\n" .. tex then return j end
+  end
+end
 
 section("M16. a job in flight past 10 s: cancelled, its slot given back, no verdict", function()
   fresh(new_fake())
@@ -1648,6 +1658,216 @@ section("M28. a width that is not a finite number", function()
   MI.finish(rctx)
   chk("M28.1 a width of NaN or an infinity, or such an indent: text, no error, no job",
     #errs == 0 and next(got) == nil and #fake.jobs == 0, vim.inspect({ errs, #fake.jobs }))
+end)
+
+section("M29. a formula whose job runs past 10 s and answers CANCELLED: three jobs, then text", function()
+  -- four workers: the three jobs below run at once, none waits
+  fresh(new_fake({ workers = 4 }))
+  local clock = 1000
+  MI._now = function() return clock end
+  MI._S.watch_at = nil
+  local function gave() return MI.stats.gave_up or 0 end
+  -- the slot count checked after every step
+  local agree, where = true, nil
+  local function check(tag)
+    local ok, why = slots_agree()
+    if not ok and agree then agree, where = false, tag .. ": " .. why end
+  end
+  local nb = new_nb({ md("st", { "old" }) })
+  activate(nb)
+  render(nb)
+  answer(job_of("old"), 2, 1, false)
+  local o = render(nb)
+  local key = slot(nb.buf, "st", 1)
+  local had_image = o[1][1] ~= nil and Image._placements[key] ~= nil
+  -- the block turns slow; an ordinary formula and one that is slow twice come with it
+  nb.cells[1].blocks = { "slow", "fine", "third" }
+  render(nb)
+  check("submitted")
+  answer(job_of("fine"), 3, 1, false)
+  o = render(nb)
+  check("fine answered")
+  chk("M29.1 an ordinary formula submitted alongside gets its image",
+    o[1][2] ~= nil and jobs_for("fine") == 1)
+  local g0, f0, c0 = gave(), MI.stats.fails, MI.stats.cancels
+  local asked, cancelled_ok, slot_kept, c2 = {}, true, true, nil
+  for k = 1, 3 do
+    clock = clock + 10500
+    local js, jt = job_of("slow"), job_of("third")
+    render(nb)
+    local st = MI.status()
+    check("overdue " .. k)
+    local es, et = MI._S.jobs[js.id], MI._S.jobs[jt.id]
+    if not (was_cancelled(js.id) and was_cancelled(jt.id) and st.overdue == 2 and st.inflight == 0
+            and es and es.ran and et and et.ran) then
+      cancelled_ok = false
+    end
+    fail(js, "cancelled", 3)
+    if k < 3 then fail(jt, "cancelled", 3) else answer(jt, 2, 1, false) end
+    check("answered " .. k)
+    o = render(nb)
+    check("render " .. k)
+    asked[k] = jobs_for("slow")
+    if k < 3 and (o[1][1] ~= nil or Image._placements[key] == nil) then slot_kept = false end
+    if k == 2 then c2 = MI.stats.cancels - c0 end
+  end
+  chk("M29.2 each time past 10 s both jobs, running, are cancelled and give their slots back", cancelled_ok)
+  chk("M29.3 the first two CANCELLED answers: asked again each time, text, the old image kept meanwhile",
+    asked[1] == 2 and asked[2] == 3 and had_image and slot_kept and c2 == 4,
+    vim.inspect({ asked, c2, had_image, slot_kept }))
+  chk("M29.4 the third: not asked again, text, its slot freed, one failure given up",
+    asked[3] == 3 and o[1][1] == nil and Image._placements[key] == nil
+      and gave() == g0 + 1 and MI.stats.fails == f0 + 1,
+    vim.inspect({ asked, gave() - g0, MI.stats.fails - f0 }))
+  chk("M29.5 a job that answers OK after two CANCELLED ones is kept and shown",
+    o[1][3] ~= nil and jobs_for("third") == 3)
+  local n0 = #fake.jobs
+  for _ = 1, 5 do
+    clock = clock + 10500
+    render(nb)
+    -- a job for it that is out by now is answered CANCELLED, as each one before
+    local j = job_of("slow")
+    if MI._S.jobs[j.id] then fail(j, "cancelled", 3) end
+    o = render(nb)
+    check("later render")
+  end
+  local st = MI.status()
+  chk("M29.6 later renders submit nothing for it: text; the others still shown",
+    #fake.jobs == n0 and jobs_for("slow") == 3 and o[1][1] == nil and o[1][2] ~= nil
+      and o[1][3] ~= nil and st.pending == 0 and st.inflight == 0 and gave() == g0 + 1,
+    vim.inspect({ #fake.jobs - n0, st.pending, st.inflight }))
+  local s0 = jobs_for("slow")
+  o = render(nb, { width = 60 })
+  check("width 60")
+  chk("M29.7 counted per width: another width asks for it again",
+    jobs_for("slow") == s0 + 1 and req_field(job_of("slow").data, "max") == "60 60" and o[1][2] ~= nil)
+  s0 = jobs_for("slow")
+  vim.cmd("hi JupynvimMathImage guifg=#00ff00")
+  o = render(nb)
+  check("new colour")
+  local j_new = job_of("slow")
+  chk("M29.8 a new colour starts the count again: the formula is asked for again",
+    jobs_for("slow") == s0 + 1 and req_field(j_new.data, "fg") == "#00ff00"
+      and req_field(j_new.data, "max") == "80 60" and MI.status().inflight == 3)
+  vim.cmd("hi JupynvimMathImage guifg=#c0caf5")
+  render(nb)
+  check("colour back")
+  chk("M29.9 the slot count agreed with the jobs at every step", agree, where)
+  MI._now = REAL_NOW
+end)
+
+section("M30. only a job that was most likely running past 10 s counts towards giving up", function()
+  fresh(new_fake({ workers = 4 }))
+  local clock = 1000
+  MI._now = function() return clock end
+  MI._S.watch_at = nil
+  local agree, where = true, nil
+  local function check(tag)
+    local ok, why = slots_agree()
+    if not ok and agree then agree, where = false, tag .. ": " .. why end
+  end
+  -- was the newest job for tex marked running when it went overdue?
+  local function ran(tex)
+    local j = job_of(tex)
+    local e = j and MI._S.jobs[j.id]
+    return e ~= nil and e.overdue and e.ran
+  end
+  local function q(k) return "q_{" .. k .. "}" end
+  -- 20 formulas, one job each, all in the "normal" lane, four workers
+  local blocks = {}
+  for k = 1, 20 do blocks[k] = q(k) end
+  local nb = new_nb({ md("hq", blocks) })
+  activate(nb)
+  render(nb)
+  check("submitted")
+  local g0 = MI.stats.gave_up or 0
+  local head_marked, lanes, o = {}, {}, nil
+  for r = 1, 3 do
+    clock = clock + 10500
+    render(nb)                                   -- all twenty go overdue at once
+    check("overdue " .. r)
+    local st = MI.status()
+    local good = st.overdue == 20 and st.inflight == 0
+    for k = 1, 20 do if ran(q(k)) ~= (k <= 4) then good = false end end
+    head_marked[r] = good
+    for k = 1, 20 do fail(job_of(q(k)), "cancelled", 3) end
+    check("answered " .. r)
+    o = render(nb)
+    check("render " .. r)
+    if r == 1 then
+      for k = 1, 20 do lanes[k] = job_of(q(k)).opts.priority end
+    end
+  end
+  chk("M30.1 four workers, twenty jobs past 10 s at once: exactly the four at the head are marked running",
+    head_marked[1] and head_marked[2] and head_marked[3], vim.inspect(head_marked))
+  local lanes_ok = true
+  for k = 1, 20 do if lanes[k] ~= (k <= 4 and "visible" or "normal") then lanes_ok = false end end
+  chk("M30.2 a job cancelled while running is asked for again first; one cancelled while waiting, in its own lane",
+    lanes_ok, vim.inspect(lanes))
+  local waiting_again = true
+  for k = 5, 20 do if jobs_for(q(k)) ~= 4 or o[1][k] ~= nil then waiting_again = false end end
+  chk("M30.3 a waiting job that answered CANCELLED three times is asked again a fourth time",
+    waiting_again and MI.status().inflight == 16)
+  local head_gone = true
+  for k = 1, 4 do if jobs_for(q(k)) ~= 3 or o[1][k] ~= nil then head_gone = false end end
+  chk("M30.4 a job at the head is given up on its third: text, not asked again",
+    head_gone and (MI.stats.gave_up or 0) == g0 + 4, tostring((MI.stats.gave_up or 0) - g0))
+  clock = clock + 10500
+  render(nb)
+  check("overdue 4")
+  local next_head = true
+  for k = 5, 20 do if ran(q(k)) ~= (k <= 8) then next_head = false end end
+  for k = 5, 20 do answer(job_of(q(k)), 2, 1, false) end
+  check("answered 4")
+  o = render(nb)
+  check("render 4")
+  local shown = 0
+  for k = 5, 20 do if o[1][k] ~= nil then shown = shown + 1 end end
+  chk("M30.5 with those given up the next four are at the head, and late answers are shown",
+    next_head and shown == 16 and MI.status().pending == 0, ("%d shown"):format(shown))
+
+  -- a "visible" job submitted after "normal" ones is taken first: it is ahead of them
+  fresh(new_fake({ workers = 4 }))
+  MI._now = function() return clock end
+  MI._S.watch_at = nil
+  local nv = new_nb({ md("pv", {}), { id = "pc", cell_type = "code", source = "", blocks = {} },
+                      md("pn", { "n_1", "n_2", "n_3", "n_4" }) })
+  local filler = {}
+  for i = 1, 400 do filler[i] = "line " .. i end
+  vim.api.nvim_buf_set_lines(nv.buf, 0, -1, false, filler)
+  activate(nv)
+  render(nv)                                     -- no window: four "normal" jobs
+  local win = vim.api.nvim_get_current_win()
+  local prev = vim.api.nvim_win_get_buf(win)
+  vim.api.nvim_win_set_buf(win, nv.buf)
+  vim.api.nvim_win_set_cursor(win, { 105, 0 })
+  vim.cmd("normal! zz")
+  nv.cells[1].blocks = { "v_1" }
+  render(nv, { win = win })                      -- one "visible" job, submitted last
+  check("visible submitted")
+  local jv = job_of("v_1")
+  local lanes_ok = jv and jv.opts.priority == "visible" and job_of("n_4").opts.priority == "normal"
+    and jv.id > job_of("n_4").id
+  clock = clock + 10500
+  render(nv, { win = win })
+  check("visible overdue")
+  chk("M30.6 a \"visible\" job submitted after \"normal\" ones counts as ahead of them",
+    lanes_ok and ran("v_1") and ran("n_1") and ran("n_2") and ran("n_3") and not ran("n_4"),
+    vim.inspect({ lanes_ok, ran("v_1"), ran("n_3"), ran("n_4") }))
+  -- none of those five answers; a new job behind them goes overdue alone
+  nv.cells[3].blocks = { "n_1", "n_2", "n_3", "n_4", "m_1" }
+  render(nv, { win = win })
+  check("behind submitted")
+  clock = clock + 10500
+  render(nv, { win = win })
+  check("behind overdue")
+  local st = MI.status()
+  chk("M30.7 overdue jobs that have not answered still count as ahead: the one behind them was waiting",
+    job_of("m_1") ~= nil and MI._S.jobs[job_of("m_1").id].overdue and not ran("m_1")
+      and st.overdue == 6 and st.inflight == 0)
+  vim.api.nvim_win_set_buf(win, prev)
+  chk("M30.8 the slot count agreed with the jobs at every step", agree, where)
+  MI._now = REAL_NOW
 end)
 
 -- ── C. setup() ──────────────────────────────────────────────────────────
