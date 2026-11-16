@@ -116,6 +116,27 @@ local function math_fg(st)
   return vim.o.background == "light" and "#24292e" or "#d0d0d0"
 end
 
+-- The terminal's cell size in pixels, asked here when the math module has
+-- not asked yet (it asks once it has the library, at a notebook's first
+-- render): one MATH_CELL call, a few system calls that never wait on the
+-- terminal. Rounded and clamped as the module does it; nil when the
+-- terminal tells no size.
+local function measure_cell(N)
+  local kind = N.KIND and N.KIND.MATH_CELL
+  if not kind then return nil end
+  local okc, ok, out = pcall(N.call, kind, "")
+  if not (okc and ok and type(out) == "string" and out:sub(1, 6) == "JNC 1\n") then return nil end
+  out = out:sub(1, 256)
+  local t = {}
+  for _, k in ipairs({ "cols", "rows", "xpixel", "ypixel" }) do
+    t[k] = tonumber(out:match("\n" .. k .. " (%d+)\n"))
+    if not t[k] or t[k] <= 0 then return nil end
+  end
+  local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
+  return { w = clamp(math.floor(t.xpixel / t.cols + 0.5), 4, 256),
+           h = clamp(math.floor(t.ypixel / t.rows + 0.5), 4, 512), source = "terminal" }
+end
+
 -- Display math shown as images (lua/jupynvim/notebook/mathimage.lua): can a
 -- formula be an image here, and if not, why. Its own section, after the
 -- palette's, with the palette's gate: it reports only on a library that is
@@ -141,8 +162,9 @@ function M._math(h)
   local kind = N.KIND and N.KIND.MATH
   local okk, sup = pcall(function() return kind and N.lib().jnv_kind_supported(kind) end)
   if not (kind and okk and tonumber(sup) == 1) then
-    h.warn("math images: this libjupynvim cannot typeset math; math shows as text",
-      { "Update the library: :JupynvimInstall, or cargo build --release in core/" })
+    -- a library from before math images (ABI 1.1): everything else works
+    h.info(("math images: this libjupynvim (ABI %s) has no math typesetter, so display math shows as text;"
+      .. " a later release, or cargo build --release in core/, has one"):format(tostring(N.status().abi)))
     return
   end
   local oks, st = pcall(MI.status)
@@ -156,29 +178,44 @@ function M._math(h)
     return
   end
   h.info(("math.renderer = %q"):format(tostring(renderer)))
+  -- a precondition said here is why images are off; the module's own
+  -- reason is printed only when none was
+  local said = false
   local jc = require("jupynvim").config or {}
   if jc.image_renderer ~= "placeholder" then
     h.info(("math images need image_renderer = \"placeholder\" (it is %q); math shows as text"):format(
       tostring(jc.image_renderer)))
+    said = true
   end
   if renderer == "auto" then
     local oki, Image = pcall(require, "jupynvim.notebook.image")
     if oki and type(Image.supported) == "function" and not Image.supported() then
       h.info("the terminal is not kitty or Ghostty, so math.renderer = \"auto\" shows math as text"
         .. " (\"image\" skips this check)")
+      said = true
     end
     if vim.api.nvim_ui_send == nil then
       h.info("Neovim 0.11: math.renderer = \"auto\" shows math as text on Neovim older than 0.12"
         .. " (\"image\" turns images on anyway)")
+      said = true
     end
   end
-  -- the cell size: measured when the module has not done it yet
+  if st.active ~= true and not said then
+    if st.lib == "unasked" then
+      h.info("math images: the math module asks for libjupynvim at the first notebook it renders,"
+        .. " and none has rendered yet in this session")
+    else
+      h.info(("math images are not on: %s; display math shows as text"):format(tostring(st.why)))
+    end
+  end
+  -- the cell size: the module's, else measured here (the module measures it
+  -- only once it has the library)
   if type(st.cell) ~= "table" and type(MI.refresh_cell_px) == "function" then
     pcall(MI.refresh_cell_px)
     local ok2, st2 = pcall(MI.status)
     if ok2 and type(st2) == "table" then st = st2 end
   end
-  local cell = type(st.cell) == "table" and st.cell or {}
+  local cell = type(st.cell) == "table" and st.cell or measure_cell(N) or {}
   local w, ht = tonumber(cell.w), tonumber(cell.h)
   if not (w and ht) then
     local nominal = type(MI._nominal) == "table" and MI._nominal or {}
