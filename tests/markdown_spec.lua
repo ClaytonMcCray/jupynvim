@@ -549,7 +549,9 @@ end
 print("6c. never asked: prose after closer, unclosed, table or fence inside, quote, list, paragraph, inline ok")
 
 -- 6d. placement, mark by mark. The calls are recorded as they are made, so
--- what nvim_buf_get_extmarks does not return (priority) is checked too.
+-- what nvim_buf_get_extmarks does not return (priority) is checked too. A
+-- source line has at most one mark: its conceal and, when an image row lies
+-- over it, that row; the rows that do not fit over the lines are one more.
 local function placed(ls, R, opts)
   opts = opts or {}
   local rec = {}
@@ -565,37 +567,48 @@ local function placed(ls, R, opts)
   assert(ok, b)
   vim.api.nvim_buf_delete(b, { force = true })
   assert(#calls == 1, "6d. asked " .. #calls .. " times for " .. vim.inspect(ls))
-  local k = { conceal = {}, overlay = {}, below = {}, above = {}, other = {} }
+  -- conceal: every mark that conceals; overlay: every mark with an image
+  -- row over its line (it conceals that line too when the line has text);
+  -- line: the one mark of each source line, by row
+  local k = { conceal = {}, overlay = {}, below = {}, above = {}, other = {}, line = {}, total = #rec }
   for _, m in ipairs(rec) do
     local o = m.o
     -- no text marks under an image: nothing inline, no line highlight
     assert(o.virt_text_pos ~= "inline" and o.line_hl_group == nil,
       "6d. a text mark under an image: " .. vim.inspect(m))
     assert(m.col == 0, "6d. a mark not at column 0: " .. vim.inspect(m))
-    if o.conceal ~= nil then k.conceal[#k.conceal + 1] = m
-    elseif o.virt_text_pos == "overlay" then k.overlay[#k.overlay + 1] = m
+    if o.conceal ~= nil or o.virt_text_pos == "overlay" then
+      assert(o.virt_lines == nil, "6d. virtual lines on a line's own mark: " .. vim.inspect(m))
+      assert(k.line[m.row] == nil, ("6d. row %d has two marks: %s and %s"):format(
+        m.row, vim.inspect(k.line[m.row]), vim.inspect(m)))
+      k.line[m.row] = m
+      if o.conceal ~= nil then k.conceal[#k.conceal + 1] = m end
+      if o.virt_text_pos == "overlay" then k.overlay[#k.overlay + 1] = m end
     elseif o.virt_lines and o.virt_lines_above then k.above[#k.above + 1] = m
     elseif o.virt_lines then k.below[#k.below + 1] = m
     else k.other[#k.other + 1] = m end
   end
   assert(#k.other == 0, "6d. unexpected marks: " .. vim.inspect(k.other))
-  -- every non-empty source line concealed whole, at priority 150
-  local want_conceal = 0
+  assert(#k.above + #k.below <= 1, "6d. more than one mark of virtual lines: " .. vim.inspect(k))
+  -- every non-empty source line concealed whole by its one mark: at
+  -- priority 150 alone, at the overlay's 160 when an image row lies over it;
+  -- an empty line has nothing to conceal
+  local lines_marked = 0
   for i, l in ipairs(ls) do
+    local m = k.line[i - 1]
+    if m then lines_marked = lines_marked + 1 end
     if #l > 0 then
-      want_conceal = want_conceal + 1
-      local found = false
-      for _, m in ipairs(k.conceal) do
-        if m.row == i - 1 then
-          assert(m.o.end_col == #l and m.o.conceal == "" and m.o.priority == 150,
-            "6d. conceal of row " .. (i - 1) .. " wrong: " .. vim.inspect(m))
-          found = true
-        end
-      end
-      assert(found, "6d. row " .. (i - 1) .. " not concealed")
+      assert(m and m.o.end_col == #l and m.o.conceal == "", "6d. row " .. (i - 1) .. " not concealed whole: "
+        .. vim.inspect(m))
+      local prio = m.o.virt_text_pos == "overlay" and 160 or 150
+      assert(m.o.priority == prio, ("6d. row %d: priority %s, want %d"):format(i - 1, tostring(m.o.priority), prio))
+    else
+      assert(not m or (m.o.conceal == nil and m.o.end_col == nil),
+        "6d. empty row " .. (i - 1) .. " concealed: " .. vim.inspect(m))
     end
   end
-  assert(#k.conceal == want_conceal, "6d. " .. #k.conceal .. " conceal marks, want " .. want_conceal)
+  assert(k.total == lines_marked + #k.above + #k.below, ("6d. %d marks: %d line marks and %d of virtual lines"):format(
+    k.total, lines_marked, #k.above + #k.below))
   return k
 end
 local function overlay_ok(m, row, chunks, what)
@@ -611,37 +624,44 @@ local function rows_of(vls)
   return table.concat(out, ",")
 end
 do
-  -- S 3, R 1: the row over the middle line, no virtual lines
+  -- S 3, R 1: the row over the middle line, no virtual lines; three marks
   local k = placed({ "$$", "x", "$$" }, 1)
-  assert(#k.overlay == 1 and #k.below == 0 and #k.above == 0, "6d. S3 R1: " .. vim.inspect(k))
+  assert(#k.overlay == 1 and #k.below == 0 and #k.above == 0 and k.total == 3, "6d. S3 R1: " .. vim.inspect(k))
   overlay_ok(k.overlay[1], 1, { { "r1", "TestPH" } }, "S3 R1")
-  -- S 3, R 3: one row over each line, in order
+  -- S 3, R 3: one row over each line, in order; three marks
   k = placed({ "\\[", "\\frac{a}{b}", "\\]" }, 3)
-  assert(#k.overlay == 3 and #k.below == 0 and #k.above == 0, "6d. S3 R3: " .. vim.inspect(k))
+  assert(#k.overlay == 3 and #k.below == 0 and #k.above == 0 and k.total == 3, "6d. S3 R3: " .. vim.inspect(k))
   table.sort(k.overlay, function(a, b) return a.row < b.row end)
   for r = 1, 3 do overlay_ok(k.overlay[r], r - 1, { { "r" .. r, "TestPH" } }, "S3 R3 row " .. r) end
-  -- S 1, R 3: one row over the line, two virtual lines under it
+  -- S 1, R 3: one row over the line, two virtual lines under it; two marks
   k = placed({ "$$\\frac{a}{b}$$" }, 3)
-  assert(#k.overlay == 1 and #k.below == 1 and #k.above == 0, "6d. S1 R3: " .. vim.inspect(k))
+  assert(#k.overlay == 1 and #k.below == 1 and #k.above == 0 and k.total == 2, "6d. S1 R3: " .. vim.inspect(k))
   overlay_ok(k.overlay[1], 0, { { "r1", "TestPH" } }, "S1 R3")
   local below = k.below[1]
   assert(below.row == 0 and not below.o.virt_lines_above and not below.o.virt_lines_leftcol
     and rows_of(below.o.virt_lines) == "r2,r3", "6d. S1 R3 virtual lines wrong: " .. vim.inspect(below))
-  -- S 5, R 2: rows over lines 2 and 3, centred
+  -- S 5, R 2: rows over lines 2 and 3, centred; five marks
   k = placed({ "$$", "a", "b", "c", "$$" }, 2)
-  assert(#k.overlay == 2 and #k.below == 0 and #k.above == 0, "6d. S5 R2: " .. vim.inspect(k))
+  assert(#k.overlay == 2 and #k.below == 0 and #k.above == 0 and k.total == 5, "6d. S5 R2: " .. vim.inspect(k))
   table.sort(k.overlay, function(a, b) return a.row < b.row end)
   overlay_ok(k.overlay[1], 1, { { "r1", "TestPH" } }, "S5 R2 first")
   overlay_ok(k.overlay[2], 2, { { "r2", "TestPH" } }, "S5 R2 second")
-  -- an empty line inside the block takes a row like any other
+  -- an empty line inside the block takes a row like any other: an overlay
+  -- that conceals nothing
   k = placed({ "$$", "", "x", "$$" }, 1)
-  assert(#k.overlay == 1, "6d. S4 R1: " .. vim.inspect(k))
+  assert(#k.overlay == 1 and #k.conceal == 3 and k.total == 4, "6d. S4 R1: " .. vim.inspect(k))
   overlay_ok(k.overlay[1], 1, { { "r1", "TestPH" } }, "S4 R1 (empty line)")
-  -- a 200-character line at width 80 wraps: every row above the block
+  -- a 200-character line at width 80 wraps: every row above the block,
+  -- each line concealed by a mark of its own
   k = placed({ "$$", string.rep("x", 200), "$$" }, 2)
-  assert(#k.overlay == 0 and #k.below == 0 and #k.above == 1, "6d. wide line: " .. vim.inspect(k))
+  assert(#k.overlay == 0 and #k.below == 0 and #k.above == 1 and #k.conceal == 3 and k.total == 4,
+    "6d. wide line: " .. vim.inspect(k))
   assert(k.above[1].row == 0 and rows_of(k.above[1].o.virt_lines) == "r1,r2",
     "6d. wide line: virtual lines above wrong: " .. vim.inspect(k.above[1]))
+  -- also when the wide line is not one an image row would lie over
+  k = placed({ "$$", string.rep("y", 200), "x", "z", "$$" }, 1)
+  assert(#k.overlay == 0 and #k.above == 1 and #k.conceal == 5 and k.total == 6, "6d. wide line below the row: "
+    .. vim.inspect(k))
   -- an indented block starts at its indent
   k = placed({ "  $$", "  x", "  $$" }, 1)
   overlay_ok(k.overlay[1], 1, { { "  ", "Normal" }, { "r1", "TestPH" } }, "indented")
@@ -657,18 +677,21 @@ do
   overlay_ok(k.overlay[1], 0, { { string.rep(" ", 40), "Normal" }, { "r1", "TestPH" } }, "center, deep indent")
   -- overlay = false: every source line concealed, all rows above the first
   k = placed({ "$$", "x", "$$" }, 1, { overlay = false })
-  assert(#k.overlay == 0 and #k.below == 0 and #k.above == 1, "6d. no overlay S3 R1: " .. vim.inspect(k))
+  assert(#k.overlay == 0 and #k.below == 0 and #k.above == 1 and k.total == 4,
+    "6d. no overlay S3 R1: " .. vim.inspect(k))
   assert(k.above[1].row == 0 and rows_of(k.above[1].o.virt_lines) == "r1",
     "6d. no overlay S3 R1: virtual lines wrong: " .. vim.inspect(k.above[1]))
   k = placed({ "$$\\frac{a}{b}$$" }, 3, { overlay = false })
-  assert(#k.overlay == 0 and #k.below == 0 and #k.above == 1, "6d. no overlay S1 R3: " .. vim.inspect(k))
+  assert(#k.overlay == 0 and #k.below == 0 and #k.above == 1 and k.total == 2,
+    "6d. no overlay S1 R3: " .. vim.inspect(k))
   assert(k.above[1].row == 0 and rows_of(k.above[1].o.virt_lines) == "r1,r2,r3",
     "6d. no overlay S1 R3: virtual lines wrong: " .. vim.inspect(k.above[1]))
   -- overlay = true is the default
   k = placed({ "$$", "x", "$$" }, 1, { overlay = true })
   assert(#k.overlay == 1 and #k.above == 0, "6d. overlay = true: " .. vim.inspect(k))
 end
-print("6d. placement: S3 R1, S3 R3, S1 R3, S5 R2, wide line, indent, center, overlay = false ok")
+print("6d. placement, one mark per source line: S3 R1, S3 R3, S1 R3, S5 R2, wide line, indent, center, "
+  .. "overlay = false ok")
 
 -- 6e. an image path that fails leaves the text rendering
 do

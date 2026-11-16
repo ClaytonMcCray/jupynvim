@@ -948,14 +948,16 @@ end
 -- is concealed, delimiter lines too. The image rows lie over the lines, one
 -- row per line: centred in the block when it has more lines than rows, so
 -- the block keeps the height its text rendering had, and with the rows the
--- lines cannot hold hanging below the last line. Those virtual lines are at
--- column 0, which puts them before the cell's own rows on that line (their
--- mark is at the end of it). A concealed line wider than the window still
--- takes all its wrapped rows, so then, and always when `overlay` is false,
--- every image row goes above the block and the concealed lines stay as
--- blank rows under it (the table renderer's pattern). Placeholder cells are
--- drawn with hl_mode "replace": the terminal reads the image from their
--- colours, which no other highlight may change.
+-- lines cannot hold hanging below the last line. A line's conceal and its
+-- image row are one mark, so a block costs one mark per source line, plus
+-- one for the rows below it. Those virtual lines are at column 0, which
+-- puts them before the cell's own rows on that line (their mark is at the
+-- end of it). A concealed line wider than the window still takes all its
+-- wrapped rows, so then, and always when `overlay` is false, every image
+-- row goes above the block and the concealed lines stay as blank rows under
+-- it (the table renderer's pattern). Placeholder cells are drawn with
+-- hl_mode "replace": the terminal reads the image from their colours, which
+-- no other highlight may change.
 local function place_block(buf, ns, base, lines, first, last, img, width, align, overlay)
   local S, R = last - first + 1, img.rows
   local indent = dw(lines[first]:match("^%s*"))
@@ -966,24 +968,39 @@ local function place_block(buf, ns, base, lines, first, last, img, width, align,
     return { { img.text[r], img.hl } }
   end
   local fits = overlay ~= false
-  for i = first, last do
-    local raw = lines[i]
-    if #raw > 0 then
-      set_mark(buf, ns, base + i - 1, 0, { end_col = #raw, conceal = "", priority = 150 })
-      if fits and dw(raw) > width then fits = false end
+  if fits then
+    for i = first, last do
+      if dw(lines[i]) > width then
+        fits = false
+        break
+      end
     end
   end
   if not fits then
+    for i = first, last do
+      local raw = lines[i]
+      if #raw > 0 then
+        set_mark(buf, ns, base + i - 1, 0, { end_col = #raw, conceal = "", priority = 150 })
+      end
+    end
     local vls = {}
     for r = 1, R do vls[r] = chunks(r) end
     set_mark(buf, ns, base + first - 1, 0, { virt_lines = vls, virt_lines_above = true })
     return
   end
+  -- image row k (1 .. min(R, S)) lies over line first + top + k - 1
   local top = S > R and math.floor((S - R) / 2) or 0
-  for k = 1, math.min(R, S) do
-    set_mark(buf, ns, base + first + top + k - 2, 0, {
-      virt_text = chunks(k), virt_text_pos = "overlay", hl_mode = "replace", priority = 160,
-    })
+  local rows = math.min(R, S)
+  for i = first, last do
+    local raw = lines[i]
+    local k = i - first - top + 1
+    if k >= 1 and k <= rows then
+      local opts = { virt_text = chunks(k), virt_text_pos = "overlay", hl_mode = "replace", priority = 160 }
+      if #raw > 0 then opts.end_col, opts.conceal = #raw, "" end
+      set_mark(buf, ns, base + i - 1, 0, opts)
+    elseif #raw > 0 then
+      set_mark(buf, ns, base + i - 1, 0, { end_col = #raw, conceal = "", priority = 150 })
+    end
   end
   if R > S then
     local below = {}
