@@ -27,7 +27,8 @@
 #      headless spec's output, so a failed spec names its failing checks)
 #   3. lua_e2e.lua (headless Neovim Lua tests)
 #   4. cellui_spec.lua (also the queued cells of a run and the release when
-#      a backend exits) + markdown_spec.lua + remote_hl_spec.lua (headless
+#      a backend exits) + markdown_spec.lua
+#      + mathtext_spec.lua (TeX -> terminal text) + remote_hl_spec.lua (headless
 #      render/UI specs) + remote_pick_open_spec.lua + remote_open_layout_spec.lua
 #      (window placement when opening a file from the remote explorer/picker)
 #      + dispatch_keys_spec.lua (global keys are session-only, issue #24)
@@ -74,6 +75,12 @@
 #      + palette_spec.lua (the palette tokens derived through the library from
 #      highlight groups, the overrides, the highlight groups and event,
 #      readable(), the path without the library, its budgets)
+#      + math_image_unit_spec.lua (display math images on a stand-in library:
+#      the requests, the cache, the jobs, the image slots, and what a render
+#      may cost) + math_image_spec.lua (display math typeset by the library
+#      and shown as placeholder images in real notebooks: the job kinds, the
+#      placement, edits, macros, what stays text, the images freed, the
+#      fixture notebook, :checkhealth and the rows on the screen)
 #      + routing_spec.lua (a local and a remote notebook open at once: every
 #      request goes to the notebook's own backend)
 #      + stream_writer_spec.lua (Kitty graphics written through nvim_ui_send,
@@ -356,6 +363,10 @@ md_out=$(nv --headless -u NONE -c "luafile $ROOT/tests/markdown_spec.lua" -c 'qa
 echo "$md_out" | grep -q "ALL MARKDOWN CHECKS PASSED"; rc=$?
 spec_out markdown_spec "$rc" "$md_out"
 section "markdown spec" "$rc"
+mt_out=$(nv --headless -u NONE -c "luafile $ROOT/tests/mathtext_spec.lua" -c 'qa!' 2>&1)
+echo "$mt_out" | grep -q "ALL MATHTEXT CHECKS PASSED"; rc=$?
+spec_out mathtext_spec "$rc" "$mt_out"
+section "mathtext spec" "$rc"
 co_out=$(nv --headless -u NONE -c "luafile $ROOT/tests/cellops_spec.lua" -c 'qa!' 2>&1)
 echo "$co_out" | grep -q "ALL CELL-OPS CHECKS PASSED"; rc=$?
 spec_out cellops_spec "$rc" "$co_out"
@@ -374,7 +385,8 @@ for spec in remote_pick_open_spec remote_open_layout_spec dispatch_keys_spec dep
             multi_image_spec install_spec output_cache_spec stale_output_e2e output_view_spec \
             html_table_spec \
             config_comment_spec pixi_env_spec release_version_spec \
-            native_spec widget_spec widget_e2e palette_spec routing_spec \
+            native_spec widget_spec widget_e2e palette_spec \
+            math_image_unit_spec math_image_spec routing_spec \
             stream_writer_spec stream_palette_spec; do
   out=$(nv --headless -u NONE -c "luafile $ROOT/tests/$spec.lua" -c 'cquit 3' 2>&1)
   rc=$?

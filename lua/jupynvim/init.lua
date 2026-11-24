@@ -38,6 +38,24 @@ M.config = {
   -- Kitty Unicode placeholder rendering. Reported as #7 by medwatt.
   image_rows = 16,
   image_cols = 48,
+  -- Display math ($$..$$, \[..\], \begin{equation}.. and ```math blocks) in markdown cells
+  -- is typeset by libjupynvim and shown as an image, like Jupyter and VS Code show it.
+  -- Inline math, and any formula that cannot be shown as an image, stays the readable
+  -- Unicode text.
+  --   renderer  "auto": an image when everything it needs is there (libjupynvim,
+  --             image_renderer = "placeholder", a kitty or Ghostty terminal, Neovim
+  --             0.12 or newer); "image": the same without asking about the terminal
+  --             and the Neovim version; "text": never an image.
+  --   scale     the size of the math: 1.0 makes one math em as tall as one line.
+  --   align     "left" (where the text rendering starts) or "center".
+  --   cell_px   { w, h }: the size of one terminal cell in pixels, when the terminal
+  --             does not tell it (some multiplexers). nil asks the terminal.
+  math = {
+    renderer = "auto",
+    scale = 1.0,
+    align = "left",
+    cell_px = nil,
+  },
   -- Per-action keymap overrides. Each value is a string (replace the lhs), a
   -- table { lhs = ..., mode = ... }, or `false` (disable). See
   -- lua/jupynvim/notebook/keymaps.lua for the full default list. nil/missing
@@ -2127,6 +2145,9 @@ function M._attach_autocmds(buf)
       if cl then cl:call("close", { session_id = nb.session_id }, function() end) end
       pcall(function() require("jupynvim.lsp.notebook").on_close(buf) end)
       Notebook.remove(buf)
+      -- the display-math images of this buffer, and what the math module
+      -- kept for it (the module may be absent: then nothing to do)
+      pcall(function() require("jupynvim.notebook.mathimage").forget_buffer(buf) end)
       pcall(Image.delete_all)
     end,
   })
@@ -3424,6 +3445,10 @@ function M.setup(opts)
   require("jupynvim.notebook.diag").setup()
   require("jupynvim.lsp").setup()
   Image.set_size({ rows = M.config.image_rows, cols = M.config.image_cols })
+  -- Display math as images: validates M.config.math, warns once about a bad
+  -- entry, installs its autocmds. Loads nothing. Without the module, math
+  -- stays text.
+  pcall(function() require("jupynvim.notebook.mathimage").setup(M.config.math) end)
 
   -- Inside tmux, image_renderer = "kitty" (direct placement) places at the
   -- TTY's cursor coordinates and is never auto-cleaned, which surfaces as

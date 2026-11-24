@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// ABI major version: a loader requires an equal major.
 pub const ABI_MAJOR: u32 = 1;
 /// ABI minor version: a loader requires at least the minor it was built for.
-pub const ABI_MINOR: u32 = 1;
+pub const ABI_MINOR: u32 = 2;
 
 // Status codes (`int32_t`), returned by functions and in `jnv_done.status`.
 /// Success.
@@ -42,7 +42,7 @@ pub const FLAG_COPY: u32 = 256;
 pub const PRIO_MASK: u32 = 3;
 
 // Job kinds. 0x0001 to 0x00ff are the diagnostics in `jobs`, 0x0800 to
-// 0x08ff the palette's (ABI 1.1).
+// 0x08ff the palette's (ABI 1.1), 0x0900 to 0x09ff the math's (ABI 1.2).
 /// No work, no result.
 pub const KIND_NOP: u32 = 1;
 /// A copy of the input.
@@ -65,6 +65,10 @@ pub const KIND_PALETTE_SCHEMA: u32 = 2049;
 /// `#rrggbb #rrggbb [target]` in; out, the first color if it reads on the
 /// second at the target contrast, else the palette's text or canvas color.
 pub const KIND_PALETTE_READABLE: u32 = 2050;
+/// Typeset one LaTeX display formula to a PNG (text in, text out; see `mathimage::wire`).
+pub const KIND_MATH: u32 = 2304;
+/// The terminal's size in cells and pixels (no input; text out).
+pub const KIND_MATH_CELL: u32 = 2305;
 
 // Selectors of `jnv_sizeof`.
 /// `jnv_sizeof(SIZEOF_BUF)` is the size of [`JnvBuf`].
@@ -96,6 +100,8 @@ pub const C_CONSTANTS: &[(&str, i64)] = &[
     ("JNV_KIND_PALETTE", KIND_PALETTE as i64),
     ("JNV_KIND_PALETTE_SCHEMA", KIND_PALETTE_SCHEMA as i64),
     ("JNV_KIND_PALETTE_READABLE", KIND_PALETTE_READABLE as i64),
+    ("JNV_KIND_MATH", KIND_MATH as i64),
+    ("JNV_KIND_MATH_CELL", KIND_MATH_CELL as i64),
     ("JNV_SIZEOF_BUF", SIZEOF_BUF as i64),
     ("JNV_SIZEOF_DONE", SIZEOF_DONE as i64),
 ];
@@ -193,9 +199,9 @@ mod tests {
     }
 
     #[test]
-    fn abi_version_is_one_one() {
+    fn abi_version_is_one_two() {
         assert_eq!(ABI_MAJOR, 1);
-        assert_eq!(ABI_MINOR, 1);
+        assert_eq!(ABI_MINOR, 2);
     }
 
     #[test]
@@ -223,6 +229,8 @@ mod tests {
             ("JNV_KIND_PALETTE", KIND_PALETTE as i64),
             ("JNV_KIND_PALETTE_SCHEMA", KIND_PALETTE_SCHEMA as i64),
             ("JNV_KIND_PALETTE_READABLE", KIND_PALETTE_READABLE as i64),
+            ("JNV_KIND_MATH", KIND_MATH as i64),
+            ("JNV_KIND_MATH_CELL", KIND_MATH_CELL as i64),
             ("JNV_SIZEOF_BUF", SIZEOF_BUF as i64),
             ("JNV_SIZEOF_DONE", SIZEOF_DONE as i64),
         ];
@@ -231,7 +239,7 @@ mod tests {
         let values: Vec<i64> = C_CONSTANTS.iter().map(|c| c.1).collect();
         assert_eq!(
             values,
-            vec![0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 256, 1, 2, 3, 4, 5, 6, 7, 2048, 2049, 2050, 1, 2]
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 256, 1, 2, 3, 4, 5, 6, 7, 2048, 2049, 2050, 2304, 2305, 1, 2]
         );
         let mut names: Vec<&str> = C_CONSTANTS.iter().map(|c| c.0).collect();
         names.sort_unstable();

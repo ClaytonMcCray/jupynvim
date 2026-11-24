@@ -42,10 +42,15 @@ local S = REG.jupynvim_native
 local has_ffi, ffi = pcall(require, "ffi")
 if not has_ffi then ffi = nil end
 
+-- The ABI this plugin needs to load the library at all: a later minor of the
+-- same major also loads. A minor that only adds job kinds does not raise it;
+-- a caller of such a kind asks jnv_kind_supported first (the math kinds came
+-- with 1.2; a 1.1 library loads, and math then shows as text).
 M.ABI_MAJOR, M.ABI_MINOR = 1, 1
 M.KIND = {
   NOP = 1, ECHO = 2, BYTESUM = 3, PTR = 4, SLEEP = 5, PANIC = 6, FILL = 7,
   PALETTE = 2048, PALETTE_SCHEMA = 2049, PALETTE_READABLE = 2050,
+  MATH = 2304, MATH_CELL = 2305,
 }
 M.STATUS = { OK = 0, ERR = 1, PANIC = 2, CANCELLED = 3, EINVAL = 4, EKIND = 5, ESHUTDOWN = 6, ENOJOB = 7 }
 M.PRIO = { visible = 0, normal = 1, background = 2 }
@@ -69,6 +74,7 @@ enum {
   JNV_KIND_SLEEP = 5, JNV_KIND_PANIC = 6, JNV_KIND_FILL = 7
 };
 enum { JNV_KIND_PALETTE = 2048, JNV_KIND_PALETTE_SCHEMA = 2049, JNV_KIND_PALETTE_READABLE = 2050 };
+enum { JNV_KIND_MATH = 2304, JNV_KIND_MATH_CELL = 2305 };
 enum { JNV_SIZEOF_BUF = 1, JNV_SIZEOF_DONE = 2 };
 uint32_t jnv_abi_version(void);
 const char *jnv_version(void);

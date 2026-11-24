@@ -2,18 +2,19 @@
 //!
 //! Kinds 0x0001 to 0x00ff are diagnostics, always built: the release check
 //! and the tests use them to prove the boundary, the worker pool and the
-//! wake path. 0x0800 to 0x0802 are the palette's (see `palette`). Later
-//! features add their kinds in their own ranges (see the header) and extend
-//! [`supported`] and [`run`].
+//! wake path. 0x0800 to 0x0802 are the palette's (see `palette`), 0x0900
+//! and 0x0901 the math's (see `mathimage`). Later features add their kinds
+//! in their own ranges (see the header) and extend [`supported`] and
+//! [`run`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::abi::{
-    KIND_BYTESUM, KIND_ECHO, KIND_FILL, KIND_NOP, KIND_PALETTE, KIND_PALETTE_READABLE,
-    KIND_PALETTE_SCHEMA, KIND_PANIC, KIND_PTR, KIND_SLEEP,
+    KIND_BYTESUM, KIND_ECHO, KIND_FILL, KIND_MATH, KIND_MATH_CELL, KIND_NOP, KIND_PALETTE,
+    KIND_PALETTE_READABLE, KIND_PALETTE_SCHEMA, KIND_PANIC, KIND_PTR, KIND_SLEEP,
 };
-use crate::palette;
+use crate::{mathimage, palette};
 
 /// The most bytes a FILL job makes (1 GiB).
 pub const FILL_MAX: u64 = 1 << 30;
@@ -36,7 +37,9 @@ pub enum JobErr {
 
 /// Whether this library runs `kind`.
 pub fn supported(kind: u32) -> bool {
-    (KIND_NOP..=KIND_FILL).contains(&kind) || (KIND_PALETTE..=KIND_PALETTE_READABLE).contains(&kind)
+    (KIND_NOP..=KIND_FILL).contains(&kind)
+        || (KIND_PALETTE..=KIND_PALETTE_READABLE).contains(&kind)
+        || (KIND_MATH..=KIND_MATH_CELL).contains(&kind)
 }
 
 /// Run `kind` on `input`. `Ok(None)` is success without a result. Callers
@@ -56,6 +59,8 @@ pub fn run(kind: u32, input: &[u8], cx: &JobCx) -> Result<Option<Vec<u8>>, JobEr
         KIND_PALETTE => palette::run_derive(input).map(Some).map_err(JobErr::Err),
         KIND_PALETTE_SCHEMA => Ok(Some(palette::run_schema())),
         KIND_PALETTE_READABLE => palette::run_readable(input).map(Some).map_err(JobErr::Err),
+        KIND_MATH => mathimage::run_typeset(input, cx).map(Some),
+        KIND_MATH_CELL => mathimage::run_cell(input).map(Some).map_err(JobErr::Err),
         _ => Err(JobErr::Err(format!("unknown kind {kind}"))),
     }
 }
@@ -158,6 +163,54 @@ mod tests {
         assert!(!supported(2047));
         assert!(!supported(2051));
         assert!(!supported(0x0800 + 3));
+        // The math kinds, 0x0900 and 0x0901.
+        assert_eq!((KIND_MATH, KIND_MATH_CELL), (2304, 2305));
+        for k in 2304..=2305 {
+            assert!(supported(k), "{k}");
+        }
+        assert!(!supported(2303));
+        assert!(!supported(2306));
+        assert!(!supported(0x0900 + 2));
+    }
+
+    #[test]
+    fn math_kinds_run_the_math_functions() {
+        let cancel = AtomicBool::new(false);
+        let cx = JobCx { cancel: &cancel };
+        let req: &[u8] = b"JNM 1\nfg #c0caf5\ncell 10 20\nscale 1\nmax 297 60\npre 0\ntex 3\n\nx^2";
+        let inputs: [&[u8]; 3] = [req, b"", b"x^2"];
+        for input in inputs {
+            assert_eq!(
+                run(KIND_MATH, input, &cx),
+                crate::mathimage::run_typeset(input, &cx).map(Some),
+                "{input:?}"
+            );
+        }
+        assert_eq!(
+            run(KIND_MATH_CELL, b"x", &cx),
+            crate::mathimage::run_cell(b"x").map(Some).map_err(JobErr::Err)
+        );
+        // With no input: the terminal's size, or no terminal at all.
+        match run(KIND_MATH_CELL, b"", &cx) {
+            Ok(Some(out)) => assert!(out.starts_with(b"JNC 1\n"), "{:?}", String::from_utf8_lossy(&out)),
+            Err(JobErr::Err(m)) => assert_eq!(m, "math cell: no terminal"),
+            other => panic!("expected the terminal's size or no terminal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn math_kinds_report_bad_input_as_job_errors() {
+        let bad_inputs: [&[u8]; 3] = [b"", b"x^2", b"JNP 1\nkind dark\n"];
+        for bad in bad_inputs {
+            match run_free(KIND_MATH, bad) {
+                Err(JobErr::Err(m)) => assert!(m.starts_with("math: request: "), "{bad:?}: {m}"),
+                other => panic!("expected an error for {bad:?}, got {other:?}"),
+            }
+        }
+        match run_free(KIND_MATH_CELL, b"x") {
+            Err(JobErr::Err(m)) => assert!(m.starts_with("math cell: "), "{m}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -313,7 +366,7 @@ mod tests {
 
     #[test]
     fn unknown_kind_is_an_error() {
-        for k in [0u32, 8, 0x100, 2047, 2051, u32::MAX] {
+        for k in [0u32, 8, 0x100, 2047, 2051, 2303, 2306, u32::MAX] {
             assert_eq!(
                 run_free(k, b"x"),
                 Err(JobErr::Err(format!("unknown kind {k}")))

@@ -558,22 +558,31 @@ test_pcall("markdown inline and block math get hl_group", function()
   vim.wait(500)
   local nb = NB.get(buf)
   local marks = vim.api.nvim_buf_get_extmarks(buf, nb.border_ns, 0, -1, { details = true })
-  local found_inline, found_block = false, false
+  -- The display block is drawn as its text rendering (JupynvimMdMathBlock),
+  -- or, where display math is shown as images, as placeholder cells in a
+  -- JupynvimPH_<id> group laid over its line.
+  local found_inline, block_text, block_image = false, false, false
+  local function is_ph(group) return type(group) == "string" and group:sub(1, 11) == "JupynvimPH_" end
   for _, m in ipairs(marks) do
     local d = m[4] or {}
     if d.hl_group == "JupynvimMdMath" then found_inline = true end
-    if d.line_hl_group == "JupynvimMdMathBlock" then found_block = true end
+    if d.line_hl_group == "JupynvimMdMathBlock" then block_text = true end
     -- New API: math is also rendered via virt_text overlays with the unicode form
     if d.virt_text then
       for _, vt in ipairs(d.virt_text) do
         if vt[2] == "JupynvimMdMath" then found_inline = true end
-        if vt[2] == "JupynvimMdMathBlock" then found_block = true end
+        if vt[2] == "JupynvimMdMathBlock" then block_text = true end
+        if d.virt_text_pos == "overlay" and is_ph(vt[2]) then block_image = true end
       end
     end
   end
+  local found_block = block_text or block_image
+  io.write(("  the display block was drawn as %s\n"):format(
+    block_image and "an image" or block_text and "text" or "neither text nor an image"))
   report("markdown inline and block math get hl_group",
          found_inline and found_block,
-         string.format("inline=%s block=%s", tostring(found_inline), tostring(found_block)))
+         string.format("inline=%s block=%s (text=%s image=%s)", tostring(found_inline), tostring(found_block),
+           tostring(block_text), tostring(block_image)))
   os.remove(p)
 end)
 

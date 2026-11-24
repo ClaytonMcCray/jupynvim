@@ -13,7 +13,7 @@
 //!   process that maps a library page whose code signature fails;
 //! - `hang`: `jnv_abi_version` never returns (it sleeps), as a library
 //!   whose load deadlocks would;
-//! - anything else (`ok`): the correct answers, ABI 1.1, the package
+//! - anything else (`ok`): the correct answers, ABI 1.2, the package
 //!   version, 16 and 24.
 //!
 //! `jnv_open` always fails with "fake library: no worker pool" (a buffer of
@@ -89,7 +89,7 @@ pub extern "C" fn jnv_abi_version() -> u32 {
     if mode_is("abi_major") {
         2 << 16
     } else {
-        (1 << 16) | 1
+        (1 << 16) | 2
     }
 }
 

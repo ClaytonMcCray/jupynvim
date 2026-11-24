@@ -119,9 +119,9 @@ fn poll_n(ctx: *mut JnvCtx, n: usize) -> Vec<JnvDone> {
 }
 
 #[test]
-fn abi_version_is_one_one() {
+fn abi_version_is_one_two() {
     let _l = start();
-    assert_eq!(jnv_abi_version(), 0x0001_0001);
+    assert_eq!(jnv_abi_version(), 0x0001_0002);
     assert_eq!(jnv_abi_version() >> 16, ABI_MAJOR);
     assert_eq!(jnv_abi_version() & 0xffff, ABI_MINOR);
 }
@@ -185,7 +185,19 @@ fn kind_supported_answers_for_the_palette_kinds() {
         assert_eq!(jnv_kind_supported(k), 1, "kind {k}");
     }
     assert_eq!((KIND_PALETTE, KIND_PALETTE_SCHEMA, KIND_PALETTE_READABLE), (0x0800, 0x0801, 0x0802));
-    for k in [0x07ff, 0x0803, 0x0900, 0x0801 + 0x10000] {
+    for k in [0x07ff, 0x0803, 0x08ff, 0x0801 + 0x10000] {
+        assert_eq!(jnv_kind_supported(k), 0, "kind {k}");
+    }
+}
+
+#[test]
+fn kind_supported_answers_for_the_math_kinds() {
+    let _l = start();
+    for k in [KIND_MATH, KIND_MATH_CELL] {
+        assert_eq!(jnv_kind_supported(k), 1, "kind {k}");
+    }
+    assert_eq!((KIND_MATH, KIND_MATH_CELL), (0x0900, 0x0901));
+    for k in [0x08ff, 0x0902, 0x0900 + 0x10000] {
         assert_eq!(jnv_kind_supported(k), 0, "kind {k}");
     }
 }
